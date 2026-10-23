@@ -132,6 +132,20 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 - **Bookmarks** (up to 64 per book) and the **summary** from the tags.
 - The progress bar shows the whole book or just the current chapter.
 
+## Audiobookshelf
+
+> Sign in from Audiobooks > Options > Audiobookshelf. Needs your own [Audiobookshelf](https://www.audiobookshelf.org) server, version 2.26 or newer, and Wi-Fi for browsing and downloading. Books are listened to without Wi-Fi.
+
+- **Sign in** with your username and password, or with an API key: put `audiobookshelf.txt` in the root of the card with the lines `server = ...` and `api_key = ...`. The file is deleted once the key works.
+- **Sync** appears on the Audiobooks page once you are signed in.
+- **Browse the server** - Continue listening, All books, Series, Authors and Search, with covers, length and how far you got. Pick the library when the server has more than one. The lists are kept on the card, so they can be looked at without Wi-Fi too.
+- **Download** a book to the card, into `Audiobooks/Author/Series/Title`, where it shows up in the Audiobooks pages and plays like any other book. A download that is cut off picks up where it stopped. **Downloads** lists them, and deletes a book from the card again.
+- **Play** opens the downloaded book in the audiobook player, where you left it, on this player or on another device.
+- **Your progress goes back to the server** - what you listen to is sent the next time there is Wi-Fi, and counts in the server's listening stats. A place reached on another device later than here is not overwritten.
+- **Picks up where you left off elsewhere** - a book you listened to on your phone moves to that place here at the next sync.
+- **Waiting to sync** - see what will be sent, and remove anything that should not be. **Sync now** offers to turn Wi-Fi on if it is off.
+- **Mark as finished**, or not finished.
+
 ## E-books
 
 > `.epub` files go in the `Ebook` folder.

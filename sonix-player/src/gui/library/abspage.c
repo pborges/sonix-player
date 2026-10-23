@@ -198,6 +198,21 @@ static void toast_saved_list(const abs_result_t *res) {
 	toast_error(text);
 }
 
+// "just now", "5 min ago", "3 h ago", "2 days ago": how long since `when`
+// (seconds since 1970).
+static void format_ago(long long when, char *out, size_t size) {
+	long long secs = (long long)time(NULL) - when;
+	if (secs < 60) {
+		snprintf(out, size, "%s", tr("abs_ago_now"));
+	} else if (secs < 3600) {
+		snprintf(out, size, tr("abs_ago_minutes"), (int)(secs / 60));
+	} else if (secs < 86400) {
+		snprintf(out, size, tr("abs_ago_hours"), (int)(secs / 3600));
+	} else {
+		snprintf(out, size, tr("abs_ago_days"), (int)(secs / 86400));
+	}
+}
+
 // A failure as the user should read it: the keys this module and the catalogue
 // use, else the transport's own words.
 static const char *error_text(const char *error) { return error[0] ? tr(error) : tr("abs_no_reply"); }
@@ -313,6 +328,12 @@ static void home_refresh(void) {
 		snprintf(text, sizeof(text), "%s", tr("abs_sync_sending"));
 	} else if (sync.pending > 0) {
 		snprintf(text, sizeof(text), tr("abs_sync_waiting"), sync.pending);
+	} else if (sync.last_sync > 0) {
+		// "All sent" alone reads the same as "nothing was ever recorded";
+		// when it went out is what tells them apart.
+		char ago[48];
+		format_ago(sync.last_sync, ago, sizeof(ago));
+		snprintf(text, sizeof(text), tr("abs_sync_all_sent_ago"), ago);
 	} else {
 		snprintf(text, sizeof(text), "%s", tr("abs_sync_all_sent"));
 	}
@@ -1798,6 +1819,13 @@ static void poll_cb(lv_timer_t *t) {
 		} else if (res.state == ABS_RESULT_LOADING && waiting == WAIT_NAMES) {
 			names_arrived(&res);
 		}
+	}
+
+	// The "2 min ago" moves on while the page sits there.
+	static uint32_t ago_refreshed;
+	if (active == home_screen && lv_tick_elaps(ago_refreshed) >= 15000) {
+		ago_refreshed = lv_tick_get();
+		home_refresh();
 	}
 
 	static unsigned seen_sync;
