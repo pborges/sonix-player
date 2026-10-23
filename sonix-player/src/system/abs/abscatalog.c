@@ -238,6 +238,15 @@ static char *cache_read(const char *root, const char *request) {
 	return read_file_content(path);
 }
 
+static bool cache_read_exists(const char *root, const char *request) {
+	if (!root[0]) {
+		return false;
+	}
+	char path[700];
+	cache_path(root, request, path, sizeof(path));
+	return access(path, F_OK) == 0;
+}
+
 // The answer to `request`: from the server when it answers, else the copy kept
 // last time, with *offline set. NULL with `error` filled when there is
 // neither.
@@ -252,11 +261,8 @@ static char *fetch(const char *root, const char *request, bool *offline, char *e
 	}
 	free(body);
 
-	char *kept = cache_read(root, request);
-	if (kept) {
-		*offline = true;
-		return kept;
-	}
+	// Why, whether or not a kept copy stands in: with the Wi-Fi up, "the list
+	// saved last time" is only half an answer, and the other half is this.
 	abs_status_t st;
 	abs_get_status(&st);
 	if (st.state == ABS_STATE_EXPIRED) {
@@ -267,7 +273,13 @@ static char *fetch(const char *root, const char *request, bool *offline, char *e
 		const char *why = http_last_error();
 		snprintf(error, error_size, "%s", why && why[0] ? why : "abs_no_reply");
 	}
-	return NULL;
+	fprintf(stderr, "abscatalog: %s failed (%s)%s\n", request, error, cache_read_exists(root, request) ? ", the saved copy is shown" : "");
+
+	char *kept = cache_read(root, request);
+	if (kept) {
+		*offline = true;
+	}
+	return kept;
 }
 
 // ---------------------------------------------------------------------------

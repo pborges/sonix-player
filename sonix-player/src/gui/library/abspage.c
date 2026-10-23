@@ -185,6 +185,19 @@ static void download_status(const absdl_entry_t *d, char *out, size_t size) {
 	}
 }
 
+// A list shown from the copy on the card. Without Wi-Fi that is the point of
+// the copy; with it, something went wrong on the way to the server, and the
+// toast says what.
+static void toast_saved_list(const abs_result_t *res) {
+	if (!online() || !res->error[0]) {
+		toast_error("abs_offline_list");
+		return;
+	}
+	char text[240];
+	snprintf(text, sizeof(text), tr("abs_saved_list_reason"), tr(res->error));
+	toast_error(text);
+}
+
 // A failure as the user should read it: the keys this module and the catalogue
 // use, else the transport's own words.
 static const char *error_text(const char *error) { return error[0] ? tr(error) : tr("abs_no_reply"); }
@@ -762,7 +775,7 @@ static void books_arrived(const abs_result_t *res) {
 					   : books_kind == ABS_LIST_SEARCH			? tr("no_results")
 																: tr("abs_no_books"));
 	if (res->offline) {
-		toast_error("abs_offline_list");
+		toast_saved_list(res);
 	}
 }
 
@@ -991,7 +1004,7 @@ static void names_arrived(const abs_result_t *res) {
 	names_set_rows(rows, count);
 	names_show_message(count > 0 ? NULL : tr("no_results"));
 	if (res->offline) {
-		toast_error("abs_offline_list");
+		toast_saved_list(res);
 	}
 }
 
