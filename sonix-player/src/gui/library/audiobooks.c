@@ -8,6 +8,7 @@
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/library/abspage.h"
 #include "src/gui/library/abssettings.h"
 #include "src/gui/library/audiobookextras.h"
 #include "src/gui/nowplaying/coverloader.h"
@@ -1048,8 +1049,7 @@ static void section_scan_cb(lv_event_t *e) {
 static gui_config_t *section_cfg;
 static int section_tiles; // how many the grid holds now
 
-// The Sync tile until its own pages exist: the account.
-static void open_sync(void) { switch_screen(abssettings_screen()); }
+static void open_sync(void) { abspage_open(); }
 
 // Four tiles, and a fifth for Audiobookshelf once an account is set up.
 static void section_set_tiles(void) {
@@ -1648,6 +1648,7 @@ void audiobooks_init(gui_config_t *cfg) {
 	build_books_page(cfg);
 	build_names_page(cfg);
 	abssettings_init(cfg);
+	abspage_init(cfg);
 	build_settings_page(cfg);
 	build_controls_page(cfg);
 	build_scan_page(cfg);

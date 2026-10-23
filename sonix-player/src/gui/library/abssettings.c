@@ -15,6 +15,7 @@
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/system/abs/abs.h"
+#include "src/system/abs/abscatalog.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/net/wifi.h"
@@ -122,6 +123,8 @@ static void open_login(void) {
 static void do_logout(void *user) {
 	(void)user;
 	abs_logout();
+	// What the server's lists were, kept for offline: that account's, not the next one's.
+	abscatalog_clear();
 	toast_success("signed_out");
 	refresh();
 }
@@ -201,6 +204,7 @@ static bool start_checks(void) {
 static void begin_waiting(const char *server) {
 	// Offered again next time, also after signing out.
 	config_set("audiobookshelf", "last_server", server);
+	config_save();
 	waiting_for_login = true;
 	toast_busy("abs_signing_in");
 }
