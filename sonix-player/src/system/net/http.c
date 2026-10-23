@@ -867,8 +867,8 @@ static conn_t stream_conn(http_stream_t *st) {
 	return c;
 }
 
-static bool stream_open_once(http_stream_t *st, const char *url, int timeout_secs, int *status_out,
-							 char *location, size_t location_size) {
+static bool stream_open_once(http_stream_t *st, const char *url, const http_stream_opts_t *opts, int timeout_secs,
+							 int *status_out, char *location, size_t location_size) {
 	url_t u;
 	if (!url_parse(url, &u)) {
 		return false;
@@ -890,17 +890,34 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 	char host_header[300];
 	host_header_value(&u, host_header, sizeof(host_header));
 
-	char request[2600];
-	int n = snprintf(request, sizeof(request),
+	char range[64] = "";
+	if (opts->offset > 0) {
+		snprintf(range, sizeof(range), "Range: bytes=%lld-\r\n", opts->offset);
+	}
+	const char *extra = opts->extra_headers ? opts->extra_headers : "";
+
+	// Sized for the longest path url_parse() accepts plus whatever the caller
+	// adds: a bearer token alone is a few hundred bytes.
+	size_t request_size = 2600 + strlen(extra);
+	char *request = malloc(request_size);
+	if (!request) {
+		conn_close(&conn);
+		return false;
+	}
+	int n = snprintf(request, request_size,
 					 "GET %s HTTP/1.0\r\n" // 1.0: no chunking, no keep-alive to argue about
 					 "Host: %s\r\n"
 					 "User-Agent: " HTTP_USER_AGENT "\r\n"
-					 "Icy-MetaData: 1\r\n"
+					 "%s"
+					 "%s"
+					 "%s"
 					 "Accept: */*\r\n"
 					 "\r\n",
-					 u.path, host_header);
+					 u.path, host_header, opts->no_icy ? "" : "Icy-MetaData: 1\r\n", range, extra);
 	// As above: snprintf returns what it would have written, not what it did.
-	if (n <= 0 || (size_t)n >= sizeof(request) || !conn_write_all(&conn, request, (size_t)n)) {
+	bool sent = n > 0 && (size_t)n < request_size && conn_write_all(&conn, request, (size_t)n);
+	free(request);
+	if (!sent) {
 		conn_close(&conn);
 		return false;
 	}
@@ -908,6 +925,7 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 	char headers[HTTP_HEADER_BUFFER];
 	int status = read_headers(&conn, headers, sizeof(headers), st->lead, sizeof(st->lead), &st->lead_len);
 	*status_out = status;
+	st->status = status;
 
 	if (status >= 300 && status < 400) {
 		location[0] = '\0';
@@ -915,7 +933,8 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 		conn_close(&conn);
 		return false;
 	}
-	if (status != 200) {
+	// 206 only answers a range that was asked for.
+	if (status != 200 && !(status == 206 && opts->offset > 0)) {
 		conn_close(&conn);
 		return false;
 	}
@@ -934,6 +953,27 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 							 ? strtol(length_text, NULL, 10)
 							 : 0;
 
+	st->range_start = 0;
+	st->full_length = header_value(headers, "Content-Length", length_text, sizeof(length_text))
+						  ? strtoll(length_text, NULL, 10)
+						  : 0;
+	if (status == 206) {
+		// "bytes 1000000-3600622/3600623": where this body starts, and the
+		// whole file's size after the slash ("*" when the server does not know).
+		char content_range[96];
+		long long first = -1;
+		if (!header_value(headers, "Content-Range", content_range, sizeof(content_range)) ||
+			sscanf(content_range, "bytes %lld-", &first) != 1 || first != opts->offset) {
+			// A range other than the one asked for: appending it would put the
+			// bytes in the wrong place.
+			conn_close(&conn);
+			return false;
+		}
+		st->range_start = first;
+		const char *slash = strchr(content_range, '/');
+		st->full_length = slash && slash[1] != '*' ? strtoll(slash + 1, NULL, 10) : 0;
+	}
+
 	header_value(headers, "icy-name", st->icy_name, sizeof(st->icy_name));
 	header_value(headers, "icy-genre", st->icy_genre, sizeof(st->icy_genre));
 
@@ -950,6 +990,17 @@ static bool stream_open_once(http_stream_t *st, const char *url, int timeout_sec
 }
 
 bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) {
+	return http_stream_open_ex(st, url, NULL, timeout_secs);
+}
+
+// Whether two URLs name the same server: same host, same port, same scheme.
+static bool same_origin(const char *a, const char *b) {
+	url_t ua, ub;
+	return url_parse(a, &ua) && url_parse(b, &ub) && strcasecmp(ua.host, ub.host) == 0 && ua.port == ub.port &&
+		   ua.secure == ub.secure;
+}
+
+bool http_stream_open_ex(http_stream_t *st, const char *url, const http_stream_opts_t *opts, int timeout_secs) {
 	if (!st || !url) {
 		return false;
 	}
@@ -957,13 +1008,21 @@ bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs) {
 	st->fd = -1;
 	clear_last_error();
 
+	http_stream_opts_t hop_opts = {0};
+	if (opts) {
+		hop_opts = *opts;
+	}
+
 	char current[2600];
 	snprintf(current, sizeof(current), "%s", url);
 
 	for (int hop = 0; hop <= HTTP_MAX_REDIRECTS; hop++) {
+		if (hop_opts.extra_headers && !same_origin(url, current)) {
+			hop_opts.extra_headers = NULL;
+		}
 		int status = 0;
 		char location[2048] = "";
-		if (stream_open_once(st, current, timeout_secs, &status, location, sizeof(location))) {
+		if (stream_open_once(st, current, &hop_opts, timeout_secs, &status, location, sizeof(location))) {
 			return true;
 		}
 		if (status < 300 || status >= 400 || !location[0]) {
