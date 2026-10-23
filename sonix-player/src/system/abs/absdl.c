@@ -896,6 +896,15 @@ void absdl_set_root(const char *sd_root) {
 	pthread_mutex_unlock(&lock);
 }
 
+void absdl_refresh(void) {
+	pthread_mutex_lock(&lock);
+	if (card_root[0]) {
+		walk_needed = true;
+		start_locked();
+	}
+	pthread_mutex_unlock(&lock);
+}
+
 bool absdl_enqueue(const char *item_id, const char *title, const char *author) {
 	if (!item_id || !item_id[0]) {
 		return false;

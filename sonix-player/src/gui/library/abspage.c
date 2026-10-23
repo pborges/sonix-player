@@ -21,6 +21,9 @@
 #include "src/system/abs/abs.h"
 #include "src/system/abs/abscatalog.h"
 #include "src/system/abs/absdl.h"
+#include "src/system/abs/abssync.h"
+#include "src/system/audio/audio.h"
+#include "src/system/playback/device_state.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/library/audiobookdb.h"
@@ -272,6 +275,7 @@ static bool tapped(void) { return !player_sheet_drag_active() && !switcher_back_
 
 static lv_obj_t *expired_row;
 static lv_obj_t *library_value;
+static lv_obj_t *sync_value;
 static abs_library_t libraries[ABS_MAX_LIBRARIES];
 static int library_count;
 
@@ -285,6 +289,18 @@ static void home_refresh(void) {
 	abs_status_t st;
 	abs_get_status(&st);
 	lv_obj_set_hidden(expired_row, st.state != ABS_STATE_EXPIRED);
+
+	abssync_status_t sync;
+	abssync_get_status(&sync);
+	char text[96];
+	if (sync.sending) {
+		snprintf(text, sizeof(text), "%s", tr("abs_sync_sending"));
+	} else if (sync.pending > 0) {
+		snprintf(text, sizeof(text), tr("abs_sync_waiting"), sync.pending);
+	} else {
+		snprintf(text, sizeof(text), "%s", tr("abs_sync_all_sent"));
+	}
+	lv_label_set_text(sync_value, text);
 
 	char name[ABS_NAME_MAX];
 	abscatalog_library(NULL, 0, name, sizeof(name));
@@ -376,6 +392,91 @@ static void authors_cb(lv_event_t *e) {
 
 static void search_cb(lv_event_t *e);
 
+// ---------------------------------------------------------------------------
+// "Sync now", and Wi-Fi when it is off
+//
+// The lyrics search's way: offer to switch the Wi-Fi on, wait up to half a
+// minute for it to join a network, then go. The progress is on the card either
+// way; nothing is lost when it never connects.
+// ---------------------------------------------------------------------------
+
+#define SYNC_WIFI_POLL_MS 500
+#define SYNC_WIFI_WAIT_MS 30000
+
+static lv_timer_t *sync_wifi_timer;
+static uint32_t sync_wifi_since;
+static bool sync_watching; // a sync this page asked for, whose end is toasted
+static unsigned sync_attempts_before;
+
+static void sync_start(void) {
+	abssync_status_t sync;
+	abssync_get_status(&sync);
+	sync_attempts_before = sync.attempts;
+	abssync_now();
+	sync_watching = true;
+	toast_busy_dismissable("abs_sync_sending");
+}
+
+static void sync_wifi_tick_cb(lv_timer_t *t) {
+	(void)t;
+	if (online()) {
+		lv_timer_delete(sync_wifi_timer);
+		sync_wifi_timer = NULL;
+		toast_busy_end();
+		sync_start();
+	} else if (!wifi_get_enabled() || lv_tick_elaps(sync_wifi_since) >= SYNC_WIFI_WAIT_MS) {
+		lv_timer_delete(sync_wifi_timer);
+		sync_wifi_timer = NULL;
+		toast_busy_end();
+		toast_error("abs_wifi_failed");
+	}
+}
+
+static void sync_enable_wifi_cb(void *user) {
+	(void)user;
+	wifi_set_enabled(true);
+	sync_wifi_since = lv_tick_get();
+	if (!sync_wifi_timer) {
+		sync_wifi_timer = lv_timer_create(sync_wifi_tick_cb, SYNC_WIFI_POLL_MS, NULL);
+	}
+	toast_busy_dismissable("abs_connecting");
+}
+
+static void sync_now_cb(lv_event_t *e) {
+	(void)e;
+	if (sync_wifi_timer) {
+		toast_busy_dismissable("abs_connecting");
+		return;
+	}
+	if (online()) {
+		sync_start();
+	} else if (!wifi_get_enabled() && wifi_available()) {
+		confirm_show("abs_sync_now", "abs_sync_wifi_note", "abs_enable_wifi", sync_enable_wifi_cb, NULL);
+	} else {
+		// On but joined to nothing: the Wi-Fi page is where that is sorted out.
+		toast_error("abs_no_network");
+	}
+}
+
+// The end of a sync this page asked for.
+static void sync_watch(void) {
+	if (!sync_watching) {
+		return;
+	}
+	abssync_status_t sync;
+	abssync_get_status(&sync);
+	if (sync.attempts == sync_attempts_before) {
+		return; // still going, or not started yet
+	}
+	sync_watching = false;
+	toast_busy_end();
+	if (sync.error[0]) {
+		toast_error(tr(sync.error));
+	} else {
+		toast_success("abs_synced");
+	}
+}
+
 static void downloads_row_cb(lv_event_t *e) {
 	(void)e;
 	downloads_open();
@@ -388,6 +489,7 @@ static void expired_cb(lv_event_t *e) {
 
 static void home_loaded_cb(lv_event_t *e) {
 	(void)e;
+	absdl_refresh();
 	home_refresh();
 	// Every visit: a library renamed or added on the server shows up here.
 	waiting = WAIT_LIBRARIES;
@@ -402,6 +504,10 @@ static void build_home(void) {
 	// which lives in the Audiobooks options and nowhere here.
 	expired_row = settingsrow_action(container, "abs_expired", expired_cb, NULL);
 	lv_obj_set_style_text_color(settingsrow_name_label(expired_row), lv_color_make(232, 96, 80), 0);
+
+	// What has not been sent yet, and the way to send it now.
+	settingsrow_add(container, "abs_sync_status", &sync_value, NULL, NULL);
+	settingsrow_action(container, "abs_sync_now", sync_now_cb, NULL);
 
 	settingsrow_add(container, "abs_library", &library_value, library_cb, NULL);
 	lv_label_set_long_mode(library_value, LV_LABEL_LONG_DOT);
@@ -949,6 +1055,8 @@ static lv_obj_t *detail_status;
 static lv_obj_t *detail_primary;
 static lv_obj_t *detail_primary_label;
 static lv_obj_t *detail_secondary;
+static lv_obj_t *detail_mark;
+static bool detail_finished;
 static char detail_id[ABS_ID_MAX];
 static char detail_title_text[ABS_TITLE_MAX];
 static char detail_author_text[ABS_NAME_MAX];
@@ -1018,6 +1126,8 @@ static void detail_show(const abs_book_t *b, const abs_detail_t *d) {
 	}
 	lv_label_set_text(detail_facts, facts);
 
+	detail_finished = b->finished;
+	lv_label_set_text(detail_mark, tr(b->finished ? "abs_mark_unfinished" : "abs_mark_finished"));
 	char place[96] = "";
 	if (b->finished) {
 		snprintf(place, sizeof(place), "%s", tr("abs_finished"));
@@ -1111,6 +1221,25 @@ static void ask_delete(const char *id, const char *title) {
 	char message[300];
 	snprintf(message, sizeof(message), tr("abs_delete_note"), title);
 	confirm_show("abs_delete_download", message, "delete", delete_confirmed, NULL);
+}
+
+// Finished, or not, said here and sent with the rest. A downloaded book is
+// marked in the audiobook list as well.
+static void detail_mark_cb(lv_event_t *e) {
+	(void)e;
+	detail_finished = !detail_finished;
+	abssync_mark_finished(detail_id, detail_finished);
+	if (detail_finished) {
+		char file[900], book[900];
+		double seconds;
+		if (absdl_file_at(detail_id, 0, file, sizeof(file), &seconds) &&
+			audiobookdb_book_for_file(file, book, sizeof(book))) {
+			audiobookdb_mark_finished(book);
+		}
+	}
+	lv_label_set_text(detail_mark, tr(detail_finished ? "abs_mark_unfinished" : "abs_mark_finished"));
+	lv_label_set_text(detail_place, tr(detail_finished ? "abs_finished" : "abs_not_started"));
+	toast_success(detail_finished ? "abs_marked_finished" : "abs_marked_unfinished");
 }
 
 static void detail_secondary_cb(lv_event_t *e) {
@@ -1228,6 +1357,12 @@ static void build_detail(void) {
 	lv_obj_add_style(secondary_label, &theme_style_text, 0);
 	lv_obj_set_style_text_font(secondary_label, &font_ui_24, 0);
 	lv_obj_center(secondary_label);
+
+	detail_mark = detail_label(detail_scroll, &font_ui_20, false, true);
+	lv_obj_set_style_text_color(detail_mark, theme()->accent, 0);
+	lv_obj_set_clickable(detail_mark, true);
+	lv_obj_set_ext_click_area(detail_mark, 12);
+	lv_obj_add_event_cb(detail_mark, detail_mark_cb, LV_EVENT_CLICKED, NULL);
 
 	detail_text = detail_label(detail_scroll, &font_ui_20, false, false);
 	lv_obj_set_style_pad_top(detail_text, 10, 0);
@@ -1402,6 +1537,7 @@ static void downloads_refresh(void) {
 }
 
 static void downloads_open(void) {
+	absdl_refresh();
 	download_count = -1; // rebuild
 	downloads_refresh();
 	switch_screen(downloads_screen);
@@ -1460,6 +1596,13 @@ static void poll_cb(lv_timer_t *t) {
 		}
 	}
 
+	static unsigned seen_sync;
+	unsigned y = abssync_serial();
+	if (y != seen_sync && active == home_screen) {
+		seen_sync = y;
+		home_refresh();
+	}
+
 	unsigned d = absdl_serial();
 	if (d != seen_downloads) {
 		seen_downloads = d;
@@ -1483,12 +1626,45 @@ static void poll_cb(lv_timer_t *t) {
 // public
 // ---------------------------------------------------------------------------
 
+// What is playing, for the sessions that become progress on the server. Runs
+// whatever is on screen.
+static void playback_tick_cb(lv_timer_t *t) {
+	(void)t;
+	char file[1024];
+	audio_get_current_file(file, sizeof(file));
+	double position = 0, total = 0;
+	audio_get_progress(&position, &total);
+	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
+	abssync_note_playback(file, playing, position);
+	sync_watch();
+
+	// The paused book was listened to elsewhere: the player goes where that
+	// left it, so play picks up there.
+	char item[40];
+	double at;
+	if (abssync_take_move(item, sizeof(item), &at) && !playing) {
+		char target[900], book[900];
+		double seconds;
+		if (absdl_file_at(item, at, target, sizeof(target), &seconds) &&
+			audiobookdb_book_for_file(target, book, sizeof(book))) {
+			if (strcmp(target, file) == 0) {
+				device_state_seek(seconds);
+				audiobookdb_save_position(book, target, seconds);
+			} else {
+				audiobooks_restore_at(book, target, seconds);
+			}
+			toast_success("abs_moved_here");
+		}
+	}
+}
+
 void abspage_open(void) { switch_screen(home_screen); }
 
 void abspage_init(gui_config_t *cfg) {
 	g_cfg = cfg;
 	abscatalog_set_root(cfg->sd_root_path);
 	absdl_set_root(cfg->sd_root_path);
+	abssync_set_root(cfg->sd_root_path);
 	build_home();
 	build_books();
 	build_names();
@@ -1497,4 +1673,5 @@ void abspage_init(gui_config_t *cfg) {
 	build_downloads();
 	seen_serial = abscatalog_serial();
 	poll_timer = lv_timer_create(poll_cb, POLL_MS, NULL);
+	lv_timer_create(playback_tick_cb, 1000, NULL);
 }

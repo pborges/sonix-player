@@ -21,6 +21,7 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/abs/abs.h"
+#include "src/system/abs/abssync.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/power.h"
@@ -695,6 +696,31 @@ static void play_book(const char *book) {
 	player_sheet_open(true);
 }
 
+void audiobooks_restore_at(const char *book, const char *file, double seconds) {
+	if (!book || !book[0] || !file || !file[0]) {
+		return;
+	}
+	if (!audiobookdb_is_folder_book(book)) {
+		device_state_restore_file(file, seconds);
+	} else {
+		char **list = NULL;
+		audiobookdb_parts_for_each(book, collect_part, &list);
+		int count = 0;
+		while (list && list[count]) {
+			count++;
+		}
+		if (count > 0) {
+			device_state_restore_list((const char *const *)list, count, 0, true, file, seconds);
+		}
+		for (int i = 0; i < count; i++) {
+			free(list[i]);
+		}
+		free(list);
+	}
+	audiobookdb_save_position(book, file, seconds);
+	player_refresh_now_playing();
+}
+
 void audiobooks_play_book(const char *book) {
 	if (book && book[0]) {
 		play_book(book);
@@ -1089,6 +1115,19 @@ static void section_show(void) {
 	// is how they get there.
 	bool empty = !audiobookdb_scan_running() && audiobookdb_count() == 0 && !abs_configured();
 	gridpage_show_empty(section_grid, section_empty, empty);
+
+	// Progress not sent yet shows on the tile, so it is seen without opening it.
+	if (section_tiles == 5) {
+		abssync_status_t sync;
+		abssync_get_status(&sync);
+		char label[64];
+		if (sync.pending > 0) {
+			snprintf(label, sizeof(label), tr("abs_sync_tile"), sync.pending);
+		} else {
+			snprintf(label, sizeof(label), "%s", tr("audiobook_sync"));
+		}
+		gridpage_set_tile(section_grid, 4, NULL, label);
+	}
 }
 
 static void section_loaded_cb(lv_event_t *e) {

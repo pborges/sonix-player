@@ -53,6 +53,11 @@ typedef struct {
 // on every card change.
 void absdl_set_root(const char *sd_root);
 
+// Reads the card again, in the background: a book deleted from the Audiobooks
+// pages or the file manager stops being listed as on the card. Cheap; called
+// whenever an Audiobookshelf page opens.
+void absdl_refresh(void);
+
 // Adds a book to the queue. False when it is already there or on the card, or
 // the queue is full.
 bool absdl_enqueue(const char *item_id, const char *title, const char *author);
