@@ -695,6 +695,12 @@ static void play_book(const char *book) {
 	player_sheet_open(true);
 }
 
+void audiobooks_play_book(const char *book) {
+	if (book && book[0]) {
+		play_book(book);
+	}
+}
+
 void audiobooks_play_at(const char *book, const char *file, double seconds) {
 	if (!book || !book[0] || !file || !file[0]) {
 		return;

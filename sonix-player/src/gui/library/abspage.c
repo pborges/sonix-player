@@ -7,7 +7,9 @@
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/library/abssettings.h"
+#include "src/gui/library/audiobooks.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/confirm.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/popover.h"
@@ -18,8 +20,11 @@
 #include "src/gui/streaming/qobuzart.h"
 #include "src/system/abs/abs.h"
 #include "src/system/abs/abscatalog.h"
+#include "src/system/abs/absdl.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
+#include "src/system/library/audiobookdb.h"
+#include "src/system/net/wifi.h"
 
 #define POLL_MS 150
 
@@ -62,11 +67,14 @@ static lv_obj_t *books_screen;
 static lv_obj_t *names_screen;
 static lv_obj_t *detail_screen;
 static lv_obj_t *search_screen;
+static lv_obj_t *downloads_screen;
+static unsigned seen_downloads;
 
 static void books_open(abs_list_t list, abs_filter_t filter, const char *filter_id, const char *title,
 					   const char *query);
 static void names_open(abs_names_t kind);
 static void detail_open(const abs_book_t *book);
+static void downloads_open(void);
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -94,8 +102,81 @@ static void book_subtitle(const abs_book_t *b, char *out, size_t size) {
 	} else if (b->started && b->progress > 0) {
 		snprintf(place, sizeof(place), "%d%%", (int)(b->progress * 100.0));
 	}
+	absdl_entry_t d;
+	if (absdl_get(b->id, &d) && (d.state == ABSDL_DONE || d.state == ABSDL_RUNNING || d.state == ABSDL_QUEUED)) {
+		size_t n = strlen(place);
+		snprintf(place + n, sizeof(place) - n, "%s%s", place[0] ? " · " : "",
+				 tr(d.state == ABSDL_DONE ? "abs_on_card" : "abs_downloading_short"));
+	}
 	snprintf(out, size, "%s%s%s%s%s", b->author, b->author[0] && length[0] ? " · " : "", length,
 			 (b->author[0] || length[0]) && place[0] ? " · " : "", place);
+}
+
+// "412 MB", "1.3 GB".
+static void format_size(long long bytes, char *out, size_t size) {
+	if (bytes >= 1000LL * 1000 * 1000) {
+		snprintf(out, size, "%.1f GB", (double)bytes / 1e9);
+	} else {
+		snprintf(out, size, "%lld MB", (bytes + 500000) / 1000000);
+	}
+}
+
+static bool online(void) {
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	return wifi.state == WIFI_STATE_CONNECTED && wifi.ip[0];
+}
+
+// A downloaded book handed to the audiobook player, where it was left.
+static void play_downloaded(const char *id) {
+	char file[900], book[900];
+	double seconds;
+	if (!absdl_file_at(id, 0, file, sizeof(file), &seconds) || !audiobookdb_book_for_file(file, book, sizeof(book))) {
+		toast_error("abs_play_not_indexed");
+		return;
+	}
+	audiobooks_play_book(book);
+}
+
+static void start_download(const char *id, const char *title, const char *author) {
+	if (!online()) {
+		toast_error("enable_wi_fi_first");
+		return;
+	}
+	if (!absdl_enqueue(id, title, author)) {
+		toast_error("abs_queue_full");
+	}
+}
+
+// What a download is doing, for a line under the book: "Downloading 45%",
+// "On the card · 412 MB", "Stopped: <why>".
+static void download_status(const absdl_entry_t *d, char *out, size_t size) {
+	char total[32];
+	format_size(d->total, total, sizeof(total));
+	switch (d->state) {
+	case ABSDL_QUEUED:
+		snprintf(out, size, "%s", tr("abs_waiting"));
+		break;
+	case ABSDL_RUNNING:
+		snprintf(out, size, tr("abs_downloading"), d->total > 0 ? (int)(d->done * 100 / d->total) : 0);
+		break;
+	case ABSDL_DONE:
+		snprintf(out, size, "%s · %s", tr("abs_on_card"), total);
+		break;
+	case ABSDL_PARTIAL:
+		if (d->error[0]) {
+			snprintf(out, size, "%s: %s", tr("abs_stopped"), tr(d->error));
+		} else {
+			snprintf(out, size, "%s", tr("abs_stopped"));
+		}
+		break;
+	case ABSDL_DELETING:
+		snprintf(out, size, "%s", tr("abs_deleting"));
+		break;
+	case ABSDL_NONE:
+		out[0] = '\0';
+		break;
+	}
 }
 
 // A failure as the user should read it: the keys this module and the catalogue
@@ -295,6 +376,11 @@ static void authors_cb(lv_event_t *e) {
 
 static void search_cb(lv_event_t *e);
 
+static void downloads_row_cb(lv_event_t *e) {
+	(void)e;
+	downloads_open();
+}
+
 static void expired_cb(lv_event_t *e) {
 	(void)e;
 	switch_screen(abssettings_screen());
@@ -323,6 +409,7 @@ static void build_home(void) {
 	lv_obj_set_height(library_value, lv_font_get_line_height(&font_ui_24));
 
 	settingsrow_add(container, "abs_continue", NULL, continue_cb, NULL);
+	settingsrow_add(container, "abs_downloads", NULL, downloads_row_cb, NULL);
 	settingsrow_add(container, "abs_all_books", NULL, all_cb, NULL);
 	settingsrow_add(container, "audiobook_series", NULL, series_cb, NULL);
 	settingsrow_add(container, "audiobook_authors", NULL, authors_cb, NULL);
@@ -619,8 +706,21 @@ static void books_open(abs_list_t list, abs_filter_t filter, const char *filter_
 	switch_screen(books_screen);
 }
 
+// A download started or finished: the rows say so.
+static void books_rebind(void) {
+	for (int i = 0; i < ROW_POOL; i++) {
+		int index = book_rows[i].index;
+		if (index >= 0 && index < book_count) {
+			char sub[300];
+			book_subtitle(&books[index], sub, sizeof(sub));
+			lv_label_set_text(book_rows[i].subtitle, sub);
+		}
+	}
+}
+
 static void books_loaded_cb(lv_event_t *e) {
 	(void)e;
+	books_rebind();
 	// Back from a book's page: the covers were handed to its big picture.
 	for (int i = 0; i < ROW_POOL; i++) {
 		if (!book_rows[i].has_art) {
@@ -845,7 +945,13 @@ static lv_obj_t *detail_author;
 static lv_obj_t *detail_facts;
 static lv_obj_t *detail_place;
 static lv_obj_t *detail_text;
+static lv_obj_t *detail_status;
+static lv_obj_t *detail_primary;
+static lv_obj_t *detail_primary_label;
+static lv_obj_t *detail_secondary;
 static char detail_id[ABS_ID_MAX];
+static char detail_title_text[ABS_TITLE_MAX];
+static char detail_author_text[ABS_NAME_MAX];
 static bool detail_art_settled;
 static bool detail_has_art;
 static cover_image_t detail_art;
@@ -927,6 +1033,91 @@ static void detail_show(const abs_book_t *b, const abs_detail_t *d) {
 	lv_label_set_text(detail_text, d && d->description ? d->description : "");
 }
 
+typedef enum {
+	ACTION_NONE,
+	ACTION_DOWNLOAD,
+	ACTION_RESUME,
+	ACTION_STOP,
+	ACTION_PLAY,
+} action_t;
+static action_t detail_action;
+
+// The buttons under a book: Download; Stop while it downloads; Play and Delete
+// once it is on the card; Resume and Delete when it stopped halfway.
+static void detail_actions_refresh(void) {
+	absdl_entry_t d;
+	bool known = absdl_get(detail_id, &d);
+	absdl_state_t state = known ? d.state : ABSDL_NONE;
+
+	char status[240] = "";
+	if (known) {
+		download_status(&d, status, sizeof(status));
+	}
+	lv_label_set_text(detail_status, status);
+	lv_obj_set_hidden(detail_status, !status[0]);
+
+	switch (state) {
+	case ABSDL_NONE:
+		detail_action = ACTION_DOWNLOAD;
+		break;
+	case ABSDL_QUEUED:
+	case ABSDL_RUNNING:
+		detail_action = ACTION_STOP;
+		break;
+	case ABSDL_DONE:
+		detail_action = ACTION_PLAY;
+		break;
+	case ABSDL_PARTIAL:
+		detail_action = ACTION_RESUME;
+		break;
+	case ABSDL_DELETING:
+		detail_action = ACTION_NONE;
+		break;
+	}
+	static const char *const LABELS[] = {"", "abs_download", "abs_resume_download", "abs_stop_download", "abs_play"};
+	lv_label_set_text(detail_primary_label, tr(LABELS[detail_action]));
+	lv_obj_set_hidden(detail_primary, detail_action == ACTION_NONE);
+	lv_obj_set_hidden(detail_secondary, !(state == ABSDL_DONE || (state == ABSDL_PARTIAL && d.folder[0])));
+}
+
+static void detail_primary_cb(lv_event_t *e) {
+	(void)e;
+	switch (detail_action) {
+	case ACTION_DOWNLOAD:
+	case ACTION_RESUME:
+		start_download(detail_id, detail_title_text, detail_author_text);
+		break;
+	case ACTION_STOP:
+		absdl_cancel(detail_id);
+		break;
+	case ACTION_PLAY:
+		play_downloaded(detail_id);
+		break;
+	case ACTION_NONE:
+		break;
+	}
+	detail_actions_refresh();
+}
+
+static char delete_id[ABS_ID_MAX];
+
+static void delete_confirmed(void *user) {
+	(void)user;
+	absdl_delete(delete_id);
+}
+
+static void ask_delete(const char *id, const char *title) {
+	snprintf(delete_id, sizeof(delete_id), "%s", id);
+	char message[300];
+	snprintf(message, sizeof(message), tr("abs_delete_note"), title);
+	confirm_show("abs_delete_download", message, "delete", delete_confirmed, NULL);
+}
+
+static void detail_secondary_cb(lv_event_t *e) {
+	(void)e;
+	ask_delete(detail_id, detail_title_text);
+}
+
 static void detail_arrived(const abs_result_t *res) {
 	if (res->state == ABS_RESULT_FAILED) {
 		lv_label_set_text(detail_text, error_text(res->error));
@@ -940,6 +1131,9 @@ static void detail_arrived(const abs_result_t *res) {
 
 static void detail_open(const abs_book_t *book) {
 	snprintf(detail_id, sizeof(detail_id), "%s", book->id);
+	snprintf(detail_title_text, sizeof(detail_title_text), "%s", book->title);
+	snprintf(detail_author_text, sizeof(detail_author_text), "%s", book->author);
+	detail_actions_refresh();
 	detail_show(book, NULL);
 	lv_obj_scroll_to_y(detail_scroll, 0, LV_ANIM_OFF);
 
@@ -999,6 +1193,42 @@ static void build_detail(void) {
 	detail_facts = detail_label(detail_scroll, &font_ui_20, true, true);
 	detail_place = detail_label(detail_scroll, &font_ui_22_bold, false, true);
 	lv_obj_set_style_text_color(detail_place, theme()->accent, 0);
+	detail_status = detail_label(detail_scroll, &font_ui_20, true, true);
+
+	lv_obj_t *buttons = lv_obj_create(detail_scroll);
+	lv_obj_set_size(buttons, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_style_bg_opa(buttons, 0, 0);
+	lv_obj_set_style_border_width(buttons, 0, 0);
+	lv_obj_set_style_pad_all(buttons, 0, 0);
+	lv_obj_set_style_pad_column(buttons, 12, 0);
+	lv_obj_set_scrollable(buttons, false);
+	lv_obj_set_event_bubble(buttons, true);
+	lv_obj_set_flex_flow(buttons, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(buttons, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+	detail_primary = lv_btn_create(buttons);
+	lv_obj_set_size(detail_primary, 200, 60);
+	lv_obj_add_style(detail_primary, &theme_style_accent_bg, 0);
+	lv_obj_set_style_radius(detail_primary, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_shadow_width(detail_primary, 0, 0);
+	lv_obj_add_event_cb(detail_primary, detail_primary_cb, LV_EVENT_CLICKED, NULL);
+	detail_primary_label = lv_label_create(detail_primary);
+	lv_obj_set_style_text_font(detail_primary_label, &font_ui_24, 0);
+	lv_obj_set_style_text_color(detail_primary_label, lv_color_white(), 0);
+	lv_obj_center(detail_primary_label);
+
+	detail_secondary = lv_btn_create(buttons);
+	lv_obj_set_size(detail_secondary, 140, 60);
+	lv_obj_add_style(detail_secondary, &theme_style_card, 0);
+	lv_obj_set_style_radius(detail_secondary, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_shadow_width(detail_secondary, 0, 0);
+	lv_obj_add_event_cb(detail_secondary, detail_secondary_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *secondary_label = lv_label_create(detail_secondary);
+	lv_label_set_text(secondary_label, tr("delete"));
+	lv_obj_add_style(secondary_label, &theme_style_text, 0);
+	lv_obj_set_style_text_font(secondary_label, &font_ui_24, 0);
+	lv_obj_center(secondary_label);
+
 	detail_text = detail_label(detail_scroll, &font_ui_20, false, false);
 	lv_obj_set_style_pad_top(detail_text, 10, 0);
 
@@ -1063,6 +1293,127 @@ static void build_search(void) {
 }
 
 // ---------------------------------------------------------------------------
+// the downloads page
+//
+// A handful of books, not a library: the rows are simply rebuilt whenever the
+// downloads move on.
+// ---------------------------------------------------------------------------
+
+#define DOWNLOADS_SHOWN 64
+
+static lv_obj_t *downloads_container;
+static lv_obj_t *downloads_empty;
+static absdl_entry_t download_rows[DOWNLOADS_SHOWN];
+static lv_obj_t *download_values[DOWNLOADS_SHOWN];
+static int download_count;
+static char picked_id[ABS_ID_MAX];
+
+static void picked_play(void *user) {
+	(void)user;
+	play_downloaded(picked_id);
+}
+
+static void picked_resume(void *user) {
+	(void)user;
+	absdl_entry_t d;
+	if (absdl_get(picked_id, &d)) {
+		start_download(d.id, d.title, d.author);
+	}
+}
+
+static void picked_stop(void *user) {
+	(void)user;
+	absdl_cancel(picked_id);
+}
+
+static void picked_delete(void *user) {
+	(void)user;
+	absdl_entry_t d;
+	if (absdl_get(picked_id, &d)) {
+		ask_delete(d.id, d.title);
+	}
+}
+
+static void download_row_cb(lv_event_t *e) {
+	int i = (int)(intptr_t)lv_event_get_user_data(e);
+	if (i < 0 || i >= download_count) {
+		return;
+	}
+	const absdl_entry_t *d = &download_rows[i];
+	snprintf(picked_id, sizeof(picked_id), "%s", d->id);
+	popover_item_t items[2];
+	int n = 0;
+	switch (d->state) {
+	case ABSDL_DONE:
+		items[n++] = (popover_item_t){.label = tr("abs_play"), .action = picked_play};
+		items[n++] = (popover_item_t){.label = tr("abs_delete_download"), .action = picked_delete};
+		break;
+	case ABSDL_PARTIAL:
+		items[n++] = (popover_item_t){.label = tr("abs_resume_download"), .action = picked_resume};
+		items[n++] = (popover_item_t){.label = tr("abs_delete_download"), .action = picked_delete};
+		break;
+	case ABSDL_QUEUED:
+	case ABSDL_RUNNING:
+		items[n++] = (popover_item_t){.label = tr("abs_stop_download"), .action = picked_stop};
+		break;
+	default:
+		return;
+	}
+	popover_show(lv_event_get_current_target(e), items, n);
+}
+
+// Only the values move while a download runs; the rows are rebuilt when the
+// list itself changes.
+static void downloads_refresh(void) {
+	absdl_entry_t now[DOWNLOADS_SHOWN];
+	int count = absdl_list(now, DOWNLOADS_SHOWN);
+	bool same = count == download_count;
+	for (int i = 0; same && i < count; i++) {
+		same = strcmp(now[i].id, download_rows[i].id) == 0;
+	}
+	memcpy(download_rows, now, (size_t)count * sizeof(*now));
+	download_count = count;
+
+	if (!same) {
+		lv_obj_clean(downloads_container);
+		for (int i = 0; i < count; i++) {
+			lv_obj_t *row = settingsrow_add(downloads_container, now[i].title, &download_values[i], download_row_cb,
+											(void *)(intptr_t)i);
+			settingsrow_name_lines(row, 2);
+			lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+			lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+			lv_obj_add_style(download_values[i], &theme_style_text_dim, 0);
+			lv_obj_set_style_text_font(download_values[i], &font_ui_20, 0);
+		}
+		downloads_empty = lv_label_create(downloads_container);
+		lv_obj_set_width(downloads_empty, lv_pct(100));
+		lv_label_set_long_mode(downloads_empty, LV_LABEL_LONG_WRAP);
+		lv_obj_set_style_text_align(downloads_empty, LV_TEXT_ALIGN_CENTER, 0);
+		lv_obj_add_style(downloads_empty, &theme_style_text_dim, 0);
+		lv_obj_set_style_text_font(downloads_empty, &font_ui_24, 0);
+		lv_label_set_text(downloads_empty, tr("abs_downloads_empty"));
+		lv_obj_set_hidden(downloads_empty, count > 0);
+	}
+	for (int i = 0; i < count; i++) {
+		char status[240];
+		download_status(&now[i], status, sizeof(status));
+		lv_label_set_text(download_values[i], status);
+	}
+}
+
+static void downloads_open(void) {
+	download_count = -1; // rebuild
+	downloads_refresh();
+	switch_screen(downloads_screen);
+}
+
+static void build_downloads(void) {
+	downloads_screen = lv_obj_create(NULL);
+	downloads_container = settingsrow_page(downloads_screen, g_cfg, "abs_downloads");
+	switcher_attach_back_gesture(downloads_screen);
+}
+
+// ---------------------------------------------------------------------------
 // the answers, and the covers
 // ---------------------------------------------------------------------------
 
@@ -1070,7 +1421,7 @@ static void poll_cb(lv_timer_t *t) {
 	(void)t;
 	lv_obj_t *active = lv_screen_active();
 	if (active != home_screen && active != books_screen && active != names_screen && active != detail_screen &&
-		active != search_screen) {
+		active != search_screen && active != downloads_screen) {
 		return;
 	}
 
@@ -1109,6 +1460,18 @@ static void poll_cb(lv_timer_t *t) {
 		}
 	}
 
+	unsigned d = absdl_serial();
+	if (d != seen_downloads) {
+		seen_downloads = d;
+		if (active == detail_screen) {
+			detail_actions_refresh();
+		} else if (active == books_screen) {
+			books_rebind();
+		} else if (active == downloads_screen) {
+			downloads_refresh();
+		}
+	}
+
 	if (active == books_screen) {
 		books_art_update();
 	} else if (active == detail_screen) {
@@ -1125,11 +1488,13 @@ void abspage_open(void) { switch_screen(home_screen); }
 void abspage_init(gui_config_t *cfg) {
 	g_cfg = cfg;
 	abscatalog_set_root(cfg->sd_root_path);
+	absdl_set_root(cfg->sd_root_path);
 	build_home();
 	build_books();
 	build_names();
 	build_detail();
 	build_search();
+	build_downloads();
 	seen_serial = abscatalog_serial();
 	poll_timer = lv_timer_create(poll_cb, POLL_MS, NULL);
 }
