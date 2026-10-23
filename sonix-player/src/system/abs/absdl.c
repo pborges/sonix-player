@@ -342,12 +342,20 @@ static void set_error(const char *id, const char *error) {
 	pthread_mutex_unlock(&lock);
 }
 
+// Counted at every piece, told at most once a second: each telling redraws
+// the page watching, and on one core that is time taken from the download.
 static void add_progress(const char *id, long long bytes) {
+	static struct timespec last_told;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
 	pthread_mutex_lock(&lock);
 	book_t *b = find_locked(id);
 	if (b) {
 		b->e.done += bytes;
-		changed_locked();
+		if (now.tv_sec != last_told.tv_sec) {
+			last_told = now;
+			changed_locked();
+		}
 	}
 	pthread_mutex_unlock(&lock);
 }
@@ -829,7 +837,10 @@ static void run_delete(const char *id, const char *root) {
 
 static void *worker(void *arg) {
 	(void)arg;
-	thread_be_background("abs downloads");
+	// Low, not idle: somebody asked for this book and is waiting for it, as
+	// with a podcast episode being saved. Idle starves it whenever the
+	// interface is busy, and the TLS underneath wants the CPU.
+	thread_be_low_priority("abs downloads");
 	for (;;) {
 		pthread_mutex_lock(&lock);
 		while (!walk_needed && queue_len == 0 && deletion_count == 0) {
