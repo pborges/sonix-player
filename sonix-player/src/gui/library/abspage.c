@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/library/abssettings.h"
@@ -71,6 +72,7 @@ static lv_obj_t *names_screen;
 static lv_obj_t *detail_screen;
 static lv_obj_t *search_screen;
 static lv_obj_t *downloads_screen;
+static lv_obj_t *queue_screen;
 static unsigned seen_downloads;
 
 static void books_open(abs_list_t list, abs_filter_t filter, const char *filter_id, const char *title,
@@ -78,6 +80,7 @@ static void books_open(abs_list_t list, abs_filter_t filter, const char *filter_
 static void names_open(abs_names_t kind);
 static void detail_open(const abs_book_t *book);
 static void downloads_open(void);
+static void queue_open(void);
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -442,6 +445,11 @@ static void sync_enable_wifi_cb(void *user) {
 	toast_busy_dismissable("abs_connecting");
 }
 
+static void sync_list_cb(lv_event_t *e) {
+	(void)e;
+	queue_open();
+}
+
 static void sync_now_cb(lv_event_t *e) {
 	(void)e;
 	if (sync_wifi_timer) {
@@ -506,7 +514,7 @@ static void build_home(void) {
 	lv_obj_set_style_text_color(settingsrow_name_label(expired_row), lv_color_make(232, 96, 80), 0);
 
 	// What has not been sent yet, and the way to send it now.
-	settingsrow_add(container, "abs_sync_status", &sync_value, NULL, NULL);
+	settingsrow_add(container, "abs_sync_status", &sync_value, sync_list_cb, NULL);
 	settingsrow_action(container, "abs_sync_now", sync_now_cb, NULL);
 
 	settingsrow_add(container, "abs_library", &library_value, library_cb, NULL);
@@ -1550,6 +1558,189 @@ static void build_downloads(void) {
 }
 
 // ---------------------------------------------------------------------------
+// what will be sent
+//
+// Every session waiting for the next sync, said the way a person would: which
+// book, when, from where to where, how long. A bin on each, for the one that
+// should never reach the server -- the book that played on in a bag, the skip
+// to the end by mistake.
+// ---------------------------------------------------------------------------
+
+#define QUEUE_SHOWN 100
+
+static lv_obj_t *queue_container;
+static abssync_entry_t queue_rows[QUEUE_SHOWN];
+static int queue_count = -1;
+static char queue_delete_id[72];
+
+// "4:01:05", "12:13": a place in a book.
+static void format_place(double seconds, char *out, size_t size) {
+	int s = seconds > 0 ? (int)(seconds + 0.5) : 0;
+	if (s >= 3600) {
+		snprintf(out, size, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+	} else {
+		snprintf(out, size, "%d:%02d", s / 60, s % 60);
+	}
+}
+
+// "Today 21:46", "Yesterday 08:10", "12 Oct 08:10".
+static void format_when(long long ms, char *out, size_t size) {
+	if (ms <= 1) {
+		snprintf(out, size, "%s", tr("abs_queue_unknown_time"));
+		return;
+	}
+	time_t t = (time_t)(ms / 1000), now = time(NULL);
+	struct tm tm, today;
+	localtime_r(&t, &tm);
+	localtime_r(&now, &today);
+	char clock[16];
+	strftime(clock, sizeof(clock), "%H:%M", &tm);
+	int days = (today.tm_year - tm.tm_year) * 366 + today.tm_yday - tm.tm_yday;
+	if (days == 0) {
+		snprintf(out, size, "%s %s", tr("abs_queue_today"), clock);
+	} else if (days == 1) {
+		snprintf(out, size, "%s %s", tr("abs_queue_yesterday"), clock);
+	} else {
+		char date[16];
+		strftime(date, sizeof(date), "%d %b", &tm);
+		snprintf(out, size, "%s %s", date, clock);
+	}
+}
+
+static void queue_describe(const abssync_entry_t *e, char *out, size_t size) {
+	char when[48], from[16], to[16];
+	format_when(e->started, when, sizeof(when));
+	format_place(e->start, from, sizeof(from));
+	format_place(e->current, to, sizeof(to));
+	if (e->finished == 1 && e->listened < 1) {
+		snprintf(out, size, "%s · %s", when, tr("abs_marked_finished"));
+	} else if (e->finished == 0) {
+		snprintf(out, size, "%s · %s", when, tr("abs_marked_unfinished"));
+	} else if (e->listened < 1) {
+		snprintf(out, size, "%s · %s %s → %s", when, tr("abs_queue_moved"), from, to);
+	} else {
+		char listened[32];
+		format_length(e->listened, listened, sizeof(listened));
+		snprintf(out, size, "%s · %s → %s · %s %s%s", when, from, to, listened, tr("abs_queue_listened"),
+				 e->open ? tr("abs_queue_now") : "");
+	}
+}
+
+static void queue_delete_confirmed(void *user) {
+	(void)user;
+	abssync_remove(queue_delete_id);
+	queue_count = -1; // rebuild
+}
+
+static void queue_delete_cb(lv_event_t *e) {
+	int i = (int)(intptr_t)lv_event_get_user_data(e);
+	if (i < 0 || i >= queue_count || queue_rows[i].open) {
+		return;
+	}
+	snprintf(queue_delete_id, sizeof(queue_delete_id), "%s", queue_rows[i].id);
+	char detail[200], message[400];
+	queue_describe(&queue_rows[i], detail, sizeof(detail));
+	snprintf(message, sizeof(message), tr("abs_queue_delete_note"), queue_rows[i].title, detail);
+	confirm_show("abs_queue_delete", message, "delete", queue_delete_confirmed, NULL);
+}
+
+static void queue_refresh(void) {
+	static abssync_entry_t now[QUEUE_SHOWN];
+	int count = abssync_list(now, QUEUE_SHOWN);
+	bool same = count == queue_count;
+	for (int i = 0; same && i < count; i++) {
+		same = strcmp(now[i].id, queue_rows[i].id) == 0 && now[i].current == queue_rows[i].current &&
+			   now[i].open == queue_rows[i].open;
+	}
+	if (same) {
+		return;
+	}
+	memcpy(queue_rows, now, (size_t)count * sizeof(*now));
+	queue_count = count;
+
+	lv_obj_clean(queue_container);
+	lv_obj_t *note = lv_label_create(queue_container);
+	lv_obj_set_width(note, lv_pct(100));
+	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+	lv_obj_add_style(note, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(note, &font_ui_20, 0);
+	lv_label_set_text(note, tr(count > 0 ? "abs_queue_note" : "abs_queue_empty"));
+
+	for (int i = 0; i < count; i++) {
+		lv_obj_t *row = lv_obj_create(queue_container);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		lv_obj_add_style(row, &theme_style_card, 0);
+		lv_obj_set_style_radius(row, 12, 0);
+		lv_obj_set_style_border_width(row, 0, 0);
+		lv_obj_set_style_shadow_width(row, 0, 0);
+		lv_obj_set_style_pad_left(row, 20, 0);
+		lv_obj_set_style_pad_right(row, 8, 0);
+		lv_obj_set_style_pad_ver(row, 12, 0);
+		lv_obj_set_scrollable(row, false);
+		lv_obj_set_event_bubble(row, true);
+		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+		lv_obj_t *text = lv_obj_create(row);
+		lv_obj_set_flex_grow(text, 1);
+		lv_obj_set_height(text, LV_SIZE_CONTENT);
+		lv_obj_set_style_bg_opa(text, 0, 0);
+		lv_obj_set_style_border_width(text, 0, 0);
+		lv_obj_set_style_pad_all(text, 0, 0);
+		lv_obj_set_style_pad_row(text, 4, 0);
+		lv_obj_set_scrollable(text, false);
+		lv_obj_set_clickable(text, false);
+		lv_obj_set_event_bubble(text, true);
+		lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
+
+		lv_obj_t *title = lv_label_create(text);
+		lv_obj_set_width(title, lv_pct(100));
+		lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+		lv_obj_set_height(title, lv_font_get_line_height(&font_ui_24));
+		lv_obj_add_style(title, &theme_style_text, 0);
+		lv_obj_set_style_text_font(title, &font_ui_24, 0);
+		lv_label_set_text(title, now[i].title[0] ? now[i].title : "?");
+
+		char detail[200];
+		queue_describe(&now[i], detail, sizeof(detail));
+		lv_obj_t *sub = lv_label_create(text);
+		lv_obj_set_width(sub, lv_pct(100));
+		lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+		lv_obj_add_style(sub, &theme_style_text_dim, 0);
+		lv_obj_set_style_text_font(sub, &font_ui_20, 0);
+		lv_label_set_text(sub, detail);
+
+		// The session still being listened to has no bin: it is not finished.
+		if (now[i].open) {
+			continue;
+		}
+		lv_obj_t *del = lv_btn_create(row);
+		lv_obj_set_size(del, 64, 64);
+		lv_obj_set_style_bg_opa(del, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_border_width(del, 0, 0);
+		lv_obj_set_style_shadow_width(del, 0, 0);
+		lv_obj_set_style_pad_all(del, 0, 0);
+		lv_obj_add_event_cb(del, queue_delete_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+		lv_obj_t *icon = lv_image_create(del);
+		lv_image_set_src(icon, &icon_trash);
+		lv_obj_add_style(icon, &theme_style_icon, 0);
+		lv_obj_center(icon);
+	}
+}
+
+static void queue_open(void) {
+	queue_count = -1;
+	queue_refresh();
+	switch_screen(queue_screen);
+}
+
+static void build_queue(void) {
+	queue_screen = lv_obj_create(NULL);
+	queue_container = settingsrow_page(queue_screen, g_cfg, "abs_queue_title");
+	switcher_attach_back_gesture(queue_screen);
+}
+
+// ---------------------------------------------------------------------------
 // the answers, and the covers
 // ---------------------------------------------------------------------------
 
@@ -1557,7 +1748,7 @@ static void poll_cb(lv_timer_t *t) {
 	(void)t;
 	lv_obj_t *active = lv_screen_active();
 	if (active != home_screen && active != books_screen && active != names_screen && active != detail_screen &&
-		active != search_screen && active != downloads_screen) {
+		active != search_screen && active != downloads_screen && active != queue_screen) {
 		return;
 	}
 
@@ -1598,9 +1789,13 @@ static void poll_cb(lv_timer_t *t) {
 
 	static unsigned seen_sync;
 	unsigned y = abssync_serial();
-	if (y != seen_sync && active == home_screen) {
+	if (y != seen_sync && (active == home_screen || active == queue_screen)) {
 		seen_sync = y;
-		home_refresh();
+		if (active == home_screen) {
+			home_refresh();
+		} else {
+			queue_refresh();
+		}
 	}
 
 	unsigned d = absdl_serial();
@@ -1671,6 +1866,7 @@ void abspage_init(gui_config_t *cfg) {
 	build_detail();
 	build_search();
 	build_downloads();
+	build_queue();
 	seen_serial = abscatalog_serial();
 	poll_timer = lv_timer_create(poll_cb, POLL_MS, NULL);
 	lv_timer_create(playback_tick_cb, 1000, NULL);

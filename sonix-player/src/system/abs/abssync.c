@@ -90,6 +90,10 @@ static double move_seconds;
 static char paused_item[40];
 static double paused_position;
 
+#define REMOVALS_MAX 64
+static char removals[REMOVALS_MAX][72];
+static int removal_count;
+
 static bool sync_requested;
 static bool sending;
 static long long last_sync;
@@ -509,6 +513,67 @@ static void recover_open(const char *root) {
 	unlink(path);
 }
 
+// The sessions taken out on the Sync page, out of the queue file. Each book
+// they were about goes back to trusting the server: what this player last said
+// about it is now the newest session left, and what was pulled is forgotten,
+// so the next sync writes the server's place back.
+static void apply_removals(const char *root) {
+	char ids[REMOVALS_MAX][72];
+	pthread_mutex_lock(&lock);
+	int n = removal_count;
+	memcpy(ids, removals, (size_t)n * sizeof(ids[0]));
+	removal_count = 0;
+	pthread_mutex_unlock(&lock);
+	if (n == 0) {
+		return;
+	}
+
+	int count = 0;
+	session_t *list = queue_read(root, &count);
+	char items[REMOVALS_MAX][40];
+	int item_count = 0;
+	int kept = 0;
+	for (int i = 0; i < count; i++) {
+		bool gone = false;
+		for (int k = 0; k < n && !gone; k++) {
+			gone = strcmp(list[i].id, ids[k]) == 0;
+		}
+		if (gone) {
+			if (item_count < REMOVALS_MAX) {
+				snprintf(items[item_count++], sizeof(items[0]), "%s", list[i].item);
+			}
+		} else {
+			list[kept++] = list[i];
+		}
+	}
+	if (kept != count) {
+		queue_rewrite(root, list, kept);
+	}
+
+	pthread_mutex_lock(&lock);
+	file_count = kept;
+	for (int k = 0; k < item_count; k++) {
+		item_state_t *st = state_for_locked(items[k], false);
+		if (!st) {
+			continue;
+		}
+		long long newest = 0;
+		for (int i = 0; i < kept; i++) {
+			if (strcmp(list[i].item, items[k]) == 0 && list[i].updated > newest) {
+				newest = list[i].updated;
+			}
+		}
+		st->local = newest;
+		st->pulled = 0;
+		states_dirty = true;
+	}
+	// The next sync fetches the server's place for them.
+	last_pull = 0;
+	bump_locked();
+	pthread_mutex_unlock(&lock);
+	free(list);
+}
+
 static void day_of(long long ms, char *date, size_t date_size, char *weekday, size_t weekday_size) {
 	static const char *const DAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 	time_t t = (time_t)(ms / 1000);
@@ -773,7 +838,7 @@ static void *worker(void *arg) {
 		struct timespec until;
 		clock_gettime(CLOCK_REALTIME, &until);
 		until.tv_sec += WAKE_SECS;
-		while (!root_changed && !sync_requested && append_count == 0 && !checkpoint_due) {
+		while (!root_changed && !sync_requested && append_count == 0 && !checkpoint_due && removal_count == 0) {
 			if (pthread_cond_timedwait(&wake, &lock, &until) == ETIMEDOUT) {
 				break;
 			}
@@ -803,6 +868,7 @@ static void *worker(void *arg) {
 			recover_open(root);
 		}
 		append_waiting(root);
+		apply_removals(root);
 		if (checkpoint) {
 			write_checkpoint(root);
 		}
@@ -881,12 +947,86 @@ void abssync_now(void) {
 void abssync_get_status(abssync_status_t *out) {
 	pthread_mutex_lock(&lock);
 	memset(out, 0, sizeof(*out));
-	out->pending = file_count + append_count + (open_session.item[0] ? 1 : 0);
+	out->pending = file_count - removal_count + append_count + (open_session.item[0] ? 1 : 0);
+	if (out->pending < 0) {
+		out->pending = 0;
+	}
 	out->sending = sending;
 	out->last_sync = last_sync;
 	snprintf(out->error, sizeof(out->error), "%s", last_error);
 	out->attempts = attempts;
 	pthread_mutex_unlock(&lock);
+}
+
+static void entry_from(const session_t *s, abssync_entry_t *e, bool open) {
+	memset(e, 0, sizeof(*e));
+	snprintf(e->id, sizeof(e->id), "%s", s->id);
+	snprintf(e->title, sizeof(e->title), "%s", s->title);
+	e->start = s->start;
+	e->current = s->current;
+	e->listened = s->listened;
+	e->started = s->started;
+	e->finished = s->finished;
+	e->open = open;
+}
+
+int abssync_list(abssync_entry_t *out, int max) {
+	char root[512];
+	pthread_mutex_lock(&lock);
+	snprintf(root, sizeof(root), "%s", card_root);
+	pthread_mutex_unlock(&lock);
+
+	int n = 0, count = 0;
+	session_t *list = root[0] ? queue_read(root, &count) : NULL;
+
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < count && n < max; i++) {
+		bool removed = false;
+		for (int k = 0; k < removal_count && !removed; k++) {
+			removed = strcmp(list[i].id, removals[k]) == 0;
+		}
+		if (!removed) {
+			entry_from(&list[i], &out[n++], false);
+		}
+	}
+	for (int i = 0; i < append_count && n < max; i++) {
+		entry_from(&to_append[i], &out[n++], false);
+	}
+	if (open_session.item[0] && n < max) {
+		entry_from(&open_session, &out[n++], true);
+	}
+	pthread_mutex_unlock(&lock);
+	free(list);
+	return n;
+}
+
+bool abssync_remove(const char *id) {
+	bool ok = false;
+	pthread_mutex_lock(&lock);
+	// Not written to the card yet: it simply never is.
+	for (int i = 0; i < append_count; i++) {
+		if (strcmp(to_append[i].id, id) == 0) {
+			item_state_t *st = state_for_locked(to_append[i].item, false);
+			if (st) {
+				st->local = 0;
+				st->pulled = 0;
+				states_dirty = true;
+			}
+			memmove(to_append + i, to_append + i + 1, (size_t)(append_count - i - 1) * sizeof(to_append[0]));
+			append_count--;
+			last_pull = 0;
+			ok = true;
+			break;
+		}
+	}
+	if (!ok && removal_count < REMOVALS_MAX) {
+		snprintf(removals[removal_count++], sizeof(removals[0]), "%s", id);
+		ok = true;
+	}
+	bump_locked();
+	pthread_cond_signal(&wake);
+	pthread_mutex_unlock(&lock);
+	return ok;
 }
 
 bool abssync_take_move(char *item_out, size_t item_size, double *book_seconds) {

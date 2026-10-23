@@ -44,6 +44,27 @@ void abssync_now(void);
 // Sent like a session.
 void abssync_mark_finished(const char *item_id, bool finished);
 
+// One session waiting to be sent, for the list on the Sync page.
+typedef struct {
+	char id[72];
+	char title[160];
+	double start, current; // seconds into the book
+	double listened;	   // seconds of actual playing
+	long long started;	   // ms since 1970; 1 when the clock was not set
+	int finished;		   // -1 nothing said, 0 marked not finished, 1 finished
+	bool open;			   // being listened to now: it closes at the next pause
+} abssync_entry_t;
+
+// What will go at the next sync, oldest first, the open session last. Returns
+// how many were written. Reads the card: GUI thread, but not every frame.
+int abssync_list(abssync_entry_t *out, int max);
+
+// Takes one session out before it is sent: a skip to the end by mistake, a
+// book left playing in a bag. The book's place then comes back from the
+// server at the next sync, as if this player had never moved it. False when
+// the session is not waiting any more.
+bool abssync_remove(const char *id);
+
 typedef struct {
 	int pending;		// sessions waiting to be sent, the open one included
 	bool sending;		// a sync is on the wire
