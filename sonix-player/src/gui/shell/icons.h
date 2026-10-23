@@ -254,6 +254,7 @@ extern const lv_image_dsc_t icon_menu_audiobook_library;
 extern const lv_image_dsc_t icon_menu_audiobook_series;
 extern const lv_image_dsc_t icon_menu_audiobook_author;
 extern const lv_image_dsc_t icon_menu_audiobook_continue;
+extern const lv_image_dsc_t icon_menu_audiobook_sync;
 extern const lv_image_dsc_t icon_menu_settings;
 extern const lv_image_dsc_t icon_menu_more;
 extern const lv_image_dsc_t icon_menu_dac;
