@@ -8,8 +8,8 @@
 
 #include "lvgl/lvgl.h"
 
-// Which tiles the main menu and the More page show, and in what order
-// (Settings > More > Homescreen).
+// Which tiles the main menu, the More page and the sections behind them show,
+// and in what order (Settings > More > Homescreen).
 //
 // The main menu's sections and the More page's tiles share three lists: the
 // main menu, the More page, and hidden. A section used rarely can step down
@@ -20,17 +20,25 @@
 // More page while the More tile is on the main menu to reach it by. The More
 // tile itself is on the main menu or hidden.
 //
-// Hiding a tile only leaves it out of its grid: the page behind it is still
-// built, and still reachable from anywhere else that leads to it.
+// The tiles inside Streaming and Wireless are only shown or hidden, on their
+// own section page.
 //
-// Both grids are built empty, hand their full list of tiles over once, and are
-// filled here, again whenever a list changes.
+// Hiding a tile only leaves it out of its grid: the page behind it is still
+// built, and still reachable from anywhere else that leads to it. A section
+// whose tiles are all off opens on an empty grid.
+//
+// Every grid is built empty, hands its full list of tiles over once, and is
+// filled here, again whenever a list or a switch changes.
 
 // How many tiles the main menu and the More page each hold.
 #define HOMESCREEN_SLOTS 6
 
 // Every tile of the main menu and the More page together.
 #define HOMESCREEN_MAX_TILES 16
+
+// Streaming and Wireless, each with a two by three grid.
+#define HOMESCREEN_SECTION_COUNT 2
+#define HOMESCREEN_SECTION_SLOTS 6
 
 typedef enum {
 	HOMESCREEN_HOME,
@@ -58,6 +66,10 @@ typedef enum {
 void homescreen_register_home(lv_obj_t *grid, gui_config_t *cfg, const grid_entry_t *entries, int count);
 void homescreen_register_more(lv_obj_t *grid, gui_config_t *cfg, const grid_entry_t *entries, int count);
 
+// A section's own grid. `section` is the section's tile on the main menu
+// ("streaming"). `entries` is copied.
+void homescreen_register_section(lv_obj_t *grid, gui_config_t *cfg, const char *section, const grid_entry_t *entries, int count);
+
 // The three lists, in order. Tiles are named by their label tag, which is
 // never translated.
 int homescreen_count(homescreen_place_t place);
@@ -67,5 +79,11 @@ homescreen_place_t homescreen_place(const char *label);
 
 // Takes the tile out of its list and puts it at `position` in `place`'s.
 homescreen_move_t homescreen_move(const char *label, homescreen_place_t place, int position);
+
+// A section's own tiles, shown or not.
+int homescreen_section_tile_count(const char *section);
+const char *homescreen_section_tile_label(const char *section, int index);
+bool homescreen_section_tile_visible(const char *section, const char *label);
+void homescreen_set_section_tile_visible(const char *section, const char *label, bool visible);
 
 #endif /* HOMESCREEN_H */

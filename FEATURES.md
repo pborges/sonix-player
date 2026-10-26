@@ -183,6 +183,7 @@ This is everything Sonix Player can do today, on both the **R1** and the **R3 Pr
 
 - **Homescreen** in Settings > More - drag each section (Music, Streaming, Wireless, Audiobooks, More) and each tile of the More page between the home screen, More and Hidden, and into the order you want. Hide Streaming and put the DAC on the home screen in its place, for example. Both pages hold six tiles.
 - Settings is always on the home screen, or in More while More is on the home screen.
+- Hide the tiles you don't use inside Streaming and Wireless too.
 
 ## Screen and appearance
 

@@ -6,7 +6,8 @@
 #include "src/system/core/config.h"
 
 // Kept in the config under [homescreen]: the three lists by the tiles' names
-// ("home = music,wireless,dac,more,settings"). A tile no list
+// ("home = music,wireless,dac,more,settings"), and a section's tiles by the
+// section's name and their own ("streaming_tidal"), 1 or 0. A tile no list
 // names goes to the end of the list it starts in, so one added by a later build
 // turns up without anyone placing it.
 #define CONFIG_SECTION "homescreen"
@@ -32,6 +33,17 @@ typedef struct {
 
 static page_t home;
 static page_t more;
+
+typedef struct {
+	lv_obj_t *grid;
+	gui_config_t *cfg;
+	const char *section;
+	grid_entry_t entries[HOMESCREEN_SECTION_SLOTS];
+	int count;
+} section_t;
+
+static section_t sections[HOMESCREEN_SECTION_COUNT];
+static int section_count;
 
 static const char *const LIST_KEYS[HOMESCREEN_PLACE_COUNT] = {
 	[HOMESCREEN_HOME] = "home",
@@ -288,4 +300,71 @@ homescreen_move_t homescreen_move(const char *label, homescreen_place_t place, i
 	lists_save();
 	fill_pages();
 	return HOMESCREEN_MOVED;
+}
+
+// ---------------------------------------------------------------------------
+// A section's own tiles
+// ---------------------------------------------------------------------------
+
+static section_t *find_section(const char *section) {
+	for (int i = 0; i < section_count; i++) {
+		if (is(sections[i].section, section)) {
+			return &sections[i];
+		}
+	}
+	return NULL;
+}
+
+static void section_key(const char *section, const char *label, char *out, size_t size) { snprintf(out, size, "%s_%s", section, label); }
+
+bool homescreen_section_tile_visible(const char *section, const char *label) {
+	char key[64];
+	section_key(section, label, key, sizeof(key));
+	return config_get_bool(CONFIG_SECTION, key, true);
+}
+
+static void fill_section(section_t *s) {
+	grid_entry_t shown[HOMESCREEN_SECTION_SLOTS];
+	int n = 0;
+	for (int i = 0; i < s->count; i++) {
+		if (homescreen_section_tile_visible(s->section, s->entries[i].label)) {
+			shown[n++] = s->entries[i];
+		}
+	}
+	gridpage_set_entries(s->grid, s->cfg, shown, n, 2, 3, true);
+}
+
+void homescreen_register_section(lv_obj_t *grid, gui_config_t *cfg, const char *section, const grid_entry_t *entries, int count) {
+	if (!grid || section_count >= HOMESCREEN_SECTION_COUNT) {
+		return;
+	}
+	section_t *s = &sections[section_count++];
+	s->grid = grid;
+	s->cfg = cfg;
+	s->section = section;
+	s->count = count < HOMESCREEN_SECTION_SLOTS ? count : HOMESCREEN_SECTION_SLOTS;
+	memcpy(s->entries, entries, (size_t)s->count * sizeof(*entries));
+	fill_section(s);
+}
+
+int homescreen_section_tile_count(const char *section) {
+	section_t *s = find_section(section);
+	return s ? s->count : 0;
+}
+
+const char *homescreen_section_tile_label(const char *section, int index) {
+	section_t *s = find_section(section);
+	return s && index >= 0 && index < s->count ? s->entries[index].label : NULL;
+}
+
+void homescreen_set_section_tile_visible(const char *section, const char *label, bool visible) {
+	char key[64];
+	section_key(section, label, key, sizeof(key));
+	config_set_bool(CONFIG_SECTION, key, visible);
+	config_save();
+
+	section_t *s = find_section(section);
+	if (s) {
+		fill_section(s);
+	}
 }

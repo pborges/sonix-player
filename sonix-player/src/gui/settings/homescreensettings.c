@@ -26,6 +26,9 @@ lv_obj_t *homescreensettings_screen;
 // live on one canvas, so a row crossing from one to another is one coordinate
 // and not a change of parent. The page scrolls by itself while a row is held
 // near its top or bottom edge.
+//
+// Under the canvas, a switch for each tile inside Streaming and Wireless,
+// greyed while its section is hidden.
 // ---------------------------------------------------------------------------
 
 #define ROW_HEIGHT 72
@@ -54,6 +57,9 @@ lv_obj_t *homescreensettings_screen;
 // page moves under it, and how far it moves each time the event comes round.
 #define EDGE_PX 70
 #define EDGE_STEP 18
+
+// The switches under the canvas.
+#define MAX_SECTION_ROWS (HOMESCREEN_SECTION_COUNT * HOMESCREEN_SECTION_SLOTS)
 
 typedef struct {
 	lv_obj_t *row;
@@ -84,10 +90,36 @@ static homescreen_place_t row_place[HOMESCREEN_MAX_TILES];
 static int row_position[HOMESCREEN_MAX_TILES];
 static int row_count;
 
+typedef struct {
+	lv_obj_t *card;
+	lv_obj_t *toggle;
+	const char *section;
+	const char *label;
+} section_row_t;
+
+static section_row_t section_rows[MAX_SECTION_ROWS];
+static int section_row_count;
+
 // The row being carried, or -1.
 static int drag_row = -1;
 static bool drag_moved;
 static lv_point_t drag_from;
+
+// Refresh the composed labels when the page opens in a different language.
+// A hidden section's switches keep their settings but cannot be changed.
+static void refresh_sections(void) {
+	for (int i = 0; i < section_row_count; i++) {
+		section_row_t *row = &section_rows[i];
+		lv_label_set_text_fmt(lv_obj_get_child(row->card, 0), tr("homescreen_section_tile"), tr(row->section), tr(row->label));
+		if (homescreen_place(row->section) != HOMESCREEN_HIDDEN) {
+			lv_obj_remove_state(row->toggle, LV_STATE_DISABLED);
+			lv_obj_set_style_opa(row->card, LV_OPA_COVER, 0);
+		} else {
+			lv_obj_add_state(row->toggle, LV_STATE_DISABLED);
+			lv_obj_set_style_opa(row->card, LV_OPA_40, 0);
+		}
+	}
+}
 
 // Where each part of the canvas starts. Each heading follows the list above
 // it, so all of them move as rows cross between lists.
@@ -130,6 +162,7 @@ static void refresh(void) {
 	}
 
 	lv_obj_set_height(body, heading_y(HOMESCREEN_PLACE_COUNT));
+	refresh_sections();
 }
 
 static void refresh_async(void *data) {
@@ -143,6 +176,7 @@ static void refresh_async(void *data) {
 
 // Where a row would land if the finger lifted at `point`: which list, and the
 // gap it would go into, counted with the carried row still in its place.
+// HOMESCREEN_PLACE_COUNT means the point is outside the canvas.
 typedef struct {
 	homescreen_place_t place;
 	int at;
@@ -151,6 +185,9 @@ typedef struct {
 static target_t target_at(lv_point_t point) {
 	lv_area_t area;
 	lv_obj_get_coords(body, &area);
+	if (point.x < area.x1 || point.x > area.x2 || point.y < area.y1 || point.y > area.y2) {
+		return (target_t){HOMESCREEN_PLACE_COUNT, 0};
+	}
 	int y = point.y - area.y1;
 
 	target_t t = {HOMESCREEN_HOME, 0};
@@ -173,6 +210,10 @@ static target_t target_at(lv_point_t point) {
 // The accent rule in the gap a drop would go into. On the canvas, so it
 // scrolls with the rows.
 static void drop_line_show(target_t t) {
+	if (t.place == HOMESCREEN_PLACE_COUNT) {
+		lv_obj_set_hidden(drop_line, true);
+		return;
+	}
 	lv_obj_set_pos(drop_line, 0, list_top(t.place) + t.at * ROW_PITCH - ROW_GAP / 2 - 2);
 	lv_obj_set_hidden(drop_line, false);
 	lv_obj_move_foreground(drop_line);
@@ -191,6 +232,9 @@ static void carried_look(int index, bool on) {
 // every gap below it in its own list is one earlier. A move the main menu or
 // More can't take is refused with a toast saying why.
 static void drop(int index, target_t t) {
+	if (t.place == HOMESCREEN_PLACE_COUNT) {
+		return;
+	}
 	homescreen_place_t from_place = row_place[index];
 	int from = row_position[index];
 	int at = t.at;
@@ -236,7 +280,13 @@ static void edge_scroll(lv_point_t point) {
 		return;
 	}
 	int scroll = lv_obj_get_scroll_y(page);
-	int limit = scroll + lv_obj_get_scroll_bottom(page);
+	// Keep the drop lists visible rather than scrolling into the switches.
+	lv_area_t canvas;
+	lv_obj_get_coords(body, &canvas);
+	int limit = scroll + canvas.y2 - view.y2 + lv_obj_get_style_pad_bottom(page, LV_PART_MAIN);
+	if (limit < 0) {
+		limit = 0;
+	}
 	int wanted = scroll + step;
 	wanted = wanted < 0 ? 0 : (wanted > limit ? limit : wanted);
 	if (wanted != scroll) {
@@ -376,6 +426,55 @@ static void make_row(entry_t *entry, int width) {
 	lv_obj_add_event_cb(entry->grip, drag_cb, LV_EVENT_PRESS_LOST, NULL);
 }
 
+// ---------------------------------------------------------------------------
+// A section's own tiles
+// ---------------------------------------------------------------------------
+
+static void section_toggled_cb(lv_event_t *e) {
+	lv_obj_t *toggle = lv_event_get_target(e);
+	for (int i = 0; i < section_row_count; i++) {
+		if (section_rows[i].toggle == toggle) {
+			homescreen_set_section_tile_visible(section_rows[i].section, section_rows[i].label, lv_obj_has_state(toggle, LV_STATE_CHECKED));
+			return;
+		}
+	}
+}
+
+static void add_section_row(lv_obj_t *container, const char *section, const char *label) {
+	if (section_row_count >= MAX_SECTION_ROWS) {
+		return;
+	}
+	section_row_t *row = &section_rows[section_row_count++];
+	row->section = section;
+	row->label = label;
+	row->card = settingsrow_toggle(container, label, &row->toggle, section_toggled_cb);
+	if (homescreen_section_tile_visible(section, label)) {
+		lv_obj_add_state(row->toggle, LV_STATE_CHECKED);
+	}
+}
+
+static void add_section_rows(void) {
+	// The tiles inside the sections, under their own heading. Music's are not
+	// here: Music settings > Rearrange main page already hides and orders them.
+	lv_obj_t *section_heading = lv_label_create(page);
+	lv_label_set_text(section_heading, tr("homescreen_section_tiles"));
+	lv_obj_add_style(section_heading, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(section_heading, &font_ui_22, 0);
+	// The full width, or the page's column centres it.
+	lv_obj_set_width(section_heading, lv_pct(100));
+	lv_obj_set_style_pad_left(section_heading, 4, 0);
+	// The switch groups keep the same order when the home tiles move.
+	static const char *const sections[HOMESCREEN_SECTION_COUNT] = {"streaming", "wireless"};
+	for (int i = 0; i < HOMESCREEN_SECTION_COUNT; i++) {
+		const char *section = sections[i];
+		int children = homescreen_section_tile_count(section);
+		for (int j = 0; j < children; j++) {
+			add_section_row(page, section, homescreen_section_tile_label(section, j));
+		}
+	}
+	lv_obj_set_hidden(section_heading, section_row_count == 0);
+}
+
 void homescreensettings_init(gui_config_t *cfg) {
 	page = settingsrow_page(homescreensettings_screen, cfg, "homescreen");
 	int width = cfg->screen_width - 2 * cfg->padding;
@@ -413,6 +512,7 @@ void homescreensettings_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(drop_line, 2, 0);
 	lv_obj_set_hidden(drop_line, true);
 
+	add_section_rows();
 	refresh();
 	lv_obj_add_event_cb(homescreensettings_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	switcher_attach_back_gesture(homescreensettings_screen);

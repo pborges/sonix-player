@@ -638,7 +638,7 @@ void gui_init(gui_config_t *cfg) {
 	flappybird_screen = lv_obj_create(NULL);
 	metronomepage_screen = lv_obj_create(NULL);
 	// Created here so its Settings > More row has somewhere to point; filled
-	// after the home screen and More page have registered their tiles.
+	// after the home screen, More, Streaming and Wireless register their tiles.
 	homescreensettings_screen = lv_obj_create(NULL);
 
 	// Persistent topbar that stays above every screen.
@@ -699,7 +699,7 @@ void gui_init(gui_config_t *cfg) {
 	imageview_init(cfg); // likewise, for a picture
 	filespage_init(cfg);
 	streaming_init(cfg);
-	homescreensettings_init(cfg); // after the home screen and More page
+	homescreensettings_init(cfg); // Streaming is the last grid to register its tiles
 
 	player_init(cfg);
 
