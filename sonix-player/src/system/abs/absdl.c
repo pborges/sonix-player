@@ -200,6 +200,8 @@ static bool sidecar_read(const char *folder, book_t *out, bool *complete) {
 		ok = out->e.id[0] != '\0';
 		if (!ok) {
 			free(out->files);
+			out->files = NULL;
+			out->file_count = 0;
 		}
 		json_free(&doc);
 	}
@@ -797,7 +799,13 @@ static void run_delete(const char *id, const char *root) {
 	pthread_mutex_unlock(&lock);
 
 	bool complete;
-	if (folder[0] && sidecar_read(folder, &b, &complete) && strcmp(b.e.id, id) == 0) {
+	bool read = folder[0] && sidecar_read(folder, &b, &complete);
+	// Another book's .abs.json: its files are not this book's to delete.
+	if (read && strcmp(b.e.id, id) != 0) {
+		free(b.files);
+		read = false;
+	}
+	if (read) {
 		for (int i = 0; i < b.file_count; i++) {
 			char path[900];
 			snprintf(path, sizeof(path), "%s/%s", b.e.folder, b.files[i].name);

@@ -73,6 +73,9 @@ unsigned audiobookdb_revision(void) {
 
 static pthread_t scan_thread;
 static volatile bool scan_running;
+// Taking scan_running is a test and a set: two threads start scans (the
+// Rescan button, a download that has just finished), and only one may win.
+static pthread_mutex_t scan_claim_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool scan_cancel;
 static volatile int scan_found;
 static char scan_root[512];
@@ -1772,15 +1775,23 @@ static void *scan_thread_func(void *arg) {
 	return NULL;
 }
 
+// Sets scan_running unless a scan already has it.
+static bool scan_claim(void) {
+	pthread_mutex_lock(&scan_claim_lock);
+	bool won = !scan_running;
+	scan_running = true;
+	pthread_mutex_unlock(&scan_claim_lock);
+	return won;
+}
+
 bool audiobookdb_scan_start(const char *root) {
-	if (!db || scan_running || !root || !root[0]) {
+	if (!db || !root || !root[0] || !scan_claim()) {
 		return false;
 	}
 
 	snprintf(scan_root, sizeof(scan_root), "%s", root);
 	scan_found = 0;
 	scan_cancel = false;
-	scan_running = true;
 
 	if (pthread_create(&scan_thread, NULL, scan_thread_func, NULL) != 0) {
 		scan_running = false;
@@ -1817,10 +1828,14 @@ static void forget_folder_locked(const char *dir) {
 }
 
 bool audiobookdb_scan_folder(const char *root, const char *dir) {
-	if (!db || scan_running || !root || !root[0] || !dir || strncmp(dir, root, strlen(root)) != 0) {
+	if (!db || !root || !root[0] || !dir || strncmp(dir, root, strlen(root)) != 0) {
 		return false;
 	}
-	scan_running = true;
+	// A full scan under way may already have passed this folder: wait for it
+	// rather than leave the book out of the index.
+	while (!scan_claim()) {
+		usleep(200 * 1000);
+	}
 	scan_cancel = false;
 	snprintf(scan_root, sizeof(scan_root), "%s", root);
 

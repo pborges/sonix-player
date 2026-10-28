@@ -965,8 +965,11 @@ static bool stream_open_once(http_stream_t *st, const char *url, const http_stre
 		if (!header_value(headers, "Content-Range", content_range, sizeof(content_range)) ||
 			sscanf(content_range, "bytes %lld-", &first) != 1 || first != opts->offset) {
 			// A range other than the one asked for: appending it would put the
-			// bytes in the wrong place.
+			// bytes in the wrong place. The stream already holds the connection,
+			// so it lets go of it too, or a close would free it twice.
 			conn_close(&conn);
+			st->fd = -1;
+			st->tls = NULL;
 			return false;
 		}
 		st->range_start = first;

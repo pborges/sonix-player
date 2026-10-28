@@ -201,9 +201,14 @@ static bool session_read(const char *line, session_t *s) {
 	return s->id[0] && s->item[0];
 }
 
-// Every session in the queue file. The caller frees.
-static session_t *queue_read(const char *root, int *count) {
+// Every session in the queue file. The caller frees. *whole (may be NULL) is
+// false when memory ran out partway: the list is then only the first ones, and
+// the file must not be rewritten from it, or the rest are gone.
+static session_t *queue_read(const char *root, int *count, bool *whole) {
 	*count = 0;
+	if (whole) {
+		*whole = true;
+	}
 	char path[600];
 	path_of(root, QUEUE_FILE, path, sizeof(path));
 	FILE *f = fopen(path, "r");
@@ -222,6 +227,9 @@ static session_t *queue_read(const char *root, int *count) {
 			int grown = capacity ? capacity * 2 : 32;
 			session_t *more = realloc(list, (size_t)grown * sizeof(*more));
 			if (!more) {
+				if (whole) {
+					*whole = false;
+				}
 				break;
 			}
 			list = more;
@@ -286,8 +294,10 @@ static void states_load(const char *root) {
 		long long local, pulled;
 		while (state_count < STATE_MAX && fscanf(f, "%39s %lld %lld", item, &local, &pulled) == 3) {
 			item_state_t *s = state_for_locked(item, true);
-			s->local = local;
-			s->pulled = pulled;
+			if (s) {
+				s->local = local;
+				s->pulled = pulled;
+			}
 		}
 		fclose(f);
 	}
@@ -529,7 +539,18 @@ static void apply_removals(const char *root) {
 	}
 
 	int count = 0;
-	session_t *list = queue_read(root, &count);
+	bool whole;
+	session_t *list = queue_read(root, &count, &whole);
+	if (!whole) {
+		// Tried again next time round, with the whole file.
+		free(list);
+		pthread_mutex_lock(&lock);
+		for (int k = 0; k < n && removal_count < REMOVALS_MAX; k++) {
+			memcpy(removals[removal_count++], ids[k], sizeof(removals[0]));
+		}
+		pthread_mutex_unlock(&lock);
+		return;
+	}
 	char items[REMOVALS_MAX][40];
 	int item_count = 0;
 	int kept = 0;
@@ -766,7 +787,8 @@ static void do_sync(const char *root, bool pull_too) {
 	char error[160] = "";
 	bool ok = true;
 	int count = 0;
-	session_t *list = queue_read(root, &count);
+	bool whole;
+	session_t *list = queue_read(root, &count, &whole);
 	int server_count = 0;
 	server_progress_t *server = NULL;
 
@@ -794,7 +816,9 @@ static void do_sync(const char *root, bool pull_too) {
 				push_finished(&list[i], server, server_count);
 			}
 		}
-		if (taken) {
+		// Not from part of the file: what was sent goes again next time, and
+		// the server keeps one copy of a session by its id.
+		if (taken && whole) {
 			queue_rewrite(root, list, kept);
 			pthread_mutex_lock(&lock);
 			file_count = kept;
@@ -860,7 +884,7 @@ static void *worker(void *arg) {
 		if (fresh_root) {
 			states_load(root);
 			int n = 0;
-			free(queue_read(root, &n));
+			free(queue_read(root, &n, NULL));
 			pthread_mutex_lock(&lock);
 			file_count = n;
 			bump_locked();
@@ -977,7 +1001,7 @@ int abssync_list(abssync_entry_t *out, int max) {
 	pthread_mutex_unlock(&lock);
 
 	int n = 0, count = 0;
-	session_t *list = root[0] ? queue_read(root, &count) : NULL;
+	session_t *list = root[0] ? queue_read(root, &count, NULL) : NULL;
 
 	pthread_mutex_lock(&lock);
 	for (int i = 0; i < count && n < max; i++) {
