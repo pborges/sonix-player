@@ -162,6 +162,22 @@ typedef struct {
 	// http_stream_read(); the caller polls it.
 	char stream_title[256];
 	bool title_changed;
+
+	// Where the body starts within the whole file: the offset asked for when
+	// the server honoured the range (206), 0 when it sent the file from its
+	// start (200). A server is allowed to ignore a range, and a caller that
+	// appended a 200 to what it already had would write the file twice over.
+	long long range_start;
+
+	// The whole file's size: Content-Range's total on a 206, Content-Length on
+	// a 200, 0 when the server did not say. 64-bit, unlike content_length,
+	// which every caller prints as a long: an audiobook can pass 2 GB.
+	long long full_length;
+
+	// The status of the last answer, kept when the open fails too: a 401 sends
+	// the caller to renew its token, a 416 says the range starts past the end.
+	// 0 when no answer came at all.
+	int status;
 } http_stream_t;
 
 // Connects, sends the request (asking for ICY metadata), reads the response
@@ -169,6 +185,26 @@ typedef struct {
 // https://, the host does not resolve, the connection or the TLS handshake
 // fails, or the status is not 200.
 bool http_stream_open(http_stream_t *st, const char *url, int timeout_secs);
+
+// What http_stream_open_ex() adds. All zero is http_stream_open().
+typedef struct {
+	// Lines already terminated with "\r\n", one per header, or NULL. Sent to
+	// the host the request starts at, and dropped on a redirect to any other
+	// host or port: an Authorization header must never reach a server it was
+	// not written for.
+	const char *extra_headers;
+
+	// Ask for the body from this byte on, 0 for all of it. A 206 and a 200
+	// are both success; range_start says which one arrived.
+	long long offset;
+
+	// Leave "Icy-MetaData: 1" out. A file is not a radio station.
+	bool no_icy;
+} http_stream_opts_t;
+
+// http_stream_open() for a download that has to sign its requests or resume
+// where it stopped. `opts` may be NULL.
+bool http_stream_open_ex(http_stream_t *st, const char *url, const http_stream_opts_t *opts, int timeout_secs);
 
 // Reads up to `len` bytes of *audio* into buf: any ICY metadata blocks in the
 // way are consumed and parsed out, never handed to the caller. Returns the

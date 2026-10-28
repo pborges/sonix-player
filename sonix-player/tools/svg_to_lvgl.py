@@ -437,6 +437,7 @@ COLOR_ICONS = [
     ("audiobook-series.png", "menu_audiobook_series", SECTION_ICON_SIZE),
     ("audiobook-author.png", "menu_audiobook_author", SECTION_ICON_SIZE),
     ("audiobook-continue.png", "menu_audiobook_continue", SECTION_ICON_SIZE),
+    ("audiobook-sync.png", "menu_audiobook_sync", SECTION_ICON_SIZE),  # Audiobookshelf, once signed in
     ("settings.png", "menu_settings", MAIN_MENU_ICON_SIZE),
     ("more.png", "menu_more", MAIN_MENU_ICON_SIZE),
     # What lives inside "More", at section size.

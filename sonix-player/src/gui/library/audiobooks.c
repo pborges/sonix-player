@@ -8,6 +8,8 @@
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/library/abspage.h"
+#include "src/gui/library/abssettings.h"
 #include "src/gui/library/audiobookextras.h"
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/nowplaying/player.h"
@@ -18,6 +20,8 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/system/abs/abs.h"
+#include "src/system/abs/abssync.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/power.h"
@@ -692,6 +696,37 @@ static void play_book(const char *book) {
 	player_sheet_open(true);
 }
 
+void audiobooks_restore_at(const char *book, const char *file, double seconds) {
+	if (!book || !book[0] || !file || !file[0]) {
+		return;
+	}
+	if (!audiobookdb_is_folder_book(book)) {
+		device_state_restore_file(file, seconds);
+	} else {
+		char **list = NULL;
+		audiobookdb_parts_for_each(book, collect_part, &list);
+		int count = 0;
+		while (list && list[count]) {
+			count++;
+		}
+		if (count > 0) {
+			device_state_restore_list((const char *const *)list, count, 0, true, file, seconds);
+		}
+		for (int i = 0; i < count; i++) {
+			free(list[i]);
+		}
+		free(list);
+	}
+	audiobookdb_save_position(book, file, seconds);
+	player_refresh_now_playing();
+}
+
+void audiobooks_play_book(const char *book) {
+	if (book && book[0]) {
+		play_book(book);
+	}
+}
+
 void audiobooks_play_at(const char *book, const char *file, double seconds) {
 	if (!book || !book[0] || !file || !file[0]) {
 		return;
@@ -1043,12 +1078,56 @@ static void section_scan_cb(lv_event_t *e) {
 
 // The tiles, a note that the card is missing -- the books and their index are
 // on it -- or the scan panel while nothing is indexed.
+static gui_config_t *section_cfg;
+static int section_tiles; // how many the grid holds now
+
+static void open_sync(void) { abspage_open(); }
+
+// Four tiles, and a fifth for Audiobookshelf once an account is set up.
+static void section_set_tiles(void) {
+	const grid_entry_t entries[] = {
+		{"audiobook_library", &icon_menu_audiobook_library, NULL, open_library},
+		{"audiobook_series", &icon_menu_audiobook_series, NULL, open_series},
+		{"audiobook_authors", &icon_menu_audiobook_author, NULL, open_authors},
+		{"audiobook_continue", &icon_menu_audiobook_continue, NULL, open_continue},
+		{"audiobook_sync", &icon_menu_audiobook_sync, NULL, open_sync},
+	};
+	int count = abs_configured() ? 5 : 4;
+	if (count == section_tiles) {
+		return;
+	}
+	if (section_grid) {
+		gridpage_set_entries(section_grid, section_cfg, entries, count, 2, 3, true);
+	} else {
+		// The Music page's grid of two by three, so the tiles are the same size.
+		section_grid = gridpage_build(audiobooks_screen, section_cfg, entries, count, 2, 3, true);
+	}
+	section_tiles = count;
+}
+
 static void section_show(void) {
+	section_set_tiles();
 	if (!gui_card_available()) {
 		gridpage_show_no_card(section_grid, section_empty, section_show);
 		return;
 	}
-	gridpage_show_empty(section_grid, section_empty, !audiobookdb_scan_running() && audiobookdb_count() == 0);
+	// With an account the grid stays even when the card has no books yet: Sync
+	// is how they get there.
+	bool empty = !audiobookdb_scan_running() && audiobookdb_count() == 0 && !abs_configured();
+	gridpage_show_empty(section_grid, section_empty, empty);
+
+	// Progress not sent yet shows on the tile, so it is seen without opening it.
+	if (section_tiles == 5) {
+		abssync_status_t sync;
+		abssync_get_status(&sync);
+		char label[64];
+		if (sync.pending > 0) {
+			snprintf(label, sizeof(label), tr("abs_sync_tile"), sync.pending);
+		} else {
+			snprintf(label, sizeof(label), "%s", tr("audiobook_sync"));
+		}
+		gridpage_set_tile(section_grid, 4, NULL, label);
+	}
 }
 
 static void section_loaded_cb(lv_event_t *e) {
@@ -1065,15 +1144,8 @@ static void section_loaded_cb(lv_event_t *e) {
 }
 
 static void build_section_page(gui_config_t *cfg) {
-	const grid_entry_t entries[] = {
-		{"audiobook_library", &icon_menu_audiobook_library, NULL, open_library},
-		{"audiobook_series", &icon_menu_audiobook_series, NULL, open_series},
-		{"audiobook_authors", &icon_menu_audiobook_author, NULL, open_authors},
-		{"audiobook_continue", &icon_menu_audiobook_continue, NULL, open_continue},
-	};
-	// The Music page's grid of two by three, so the tiles are the same size.
-	section_grid =
-		gridpage_build(audiobooks_screen, cfg, entries, (int)(sizeof(entries) / sizeof(entries[0])), 2, 3, true);
+	section_cfg = cfg;
+	section_set_tiles();
 	section_empty =
 		gridpage_empty_panel(audiobooks_screen, cfg, &icon_book_headphones, "audiobook_no_database", section_scan_cb);
 
@@ -1295,6 +1367,7 @@ static void settings_loaded_cb(lv_event_t *e) {
 static void build_settings_page(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(audiobooksettings_screen, cfg, "audiobooks");
 	settingsrow_add(container, "change_controls", NULL, switch_screen_cb, audiobookcontrols_screen);
+	settingsrow_add(container, "audiobookshelf", NULL, switch_screen_cb, abssettings_screen());
 
 	// What the progress bar on the player stands for: the whole book, or the
 	// chapter being listened to. Only a book with chapter marks is affected.
@@ -1619,6 +1692,8 @@ void audiobooks_init(gui_config_t *cfg) {
 	build_section_page(cfg);
 	build_books_page(cfg);
 	build_names_page(cfg);
+	abssettings_init(cfg);
+	abspage_init(cfg);
 	build_settings_page(cfg);
 	build_controls_page(cfg);
 	build_scan_page(cfg);

@@ -51,6 +51,18 @@ bool audiobookdb_needs_rescan(void);
 
 bool audiobookdb_scan_start(const char *root);
 bool audiobookdb_scan_running(void);
+
+// Indexes the books in one folder under `root` (the Audiobooks folder) again:
+// a book just downloaded into it, or one just deleted from it, without the
+// rescan of the whole card. Where each book was left is kept. Blocks while it
+// reads the tags, so not on the GUI thread; false, doing nothing, while a full
+// scan is running -- which picks the folder up anyway.
+bool audiobookdb_scan_folder(const char *root, const char *dir);
+
+// The order the parts of a folder book are played in: names compared without
+// regard to case, runs of digits as numbers ("2 x" before "10 x"). For whoever
+// names files that must come out in a given order.
+int audiobookdb_name_compare(const char *a, const char *b);
 int audiobookdb_scan_found(void);
 void audiobookdb_scan_stop(void);
 

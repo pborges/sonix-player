@@ -17,6 +17,14 @@ extern lv_obj_t *audiobookscan_screen;
 
 void audiobooks_init(gui_config_t *cfg);
 
+// Starts `book` where it was left and brings the player up, as tapping it in
+// the Library does.
+void audiobooks_play_book(const char *book);
+
+// Puts `book` in the player paused at `file` and `seconds`, the whole book
+// queued as when it is played: where another device left it.
+void audiobooks_restore_at(const char *book, const char *file, double seconds);
+
 // Starts `book` (a file, or a folder book's folder) in `file` at `seconds`,
 // and writes that as where the book stands. The player is left as it is: the
 // caller decides whether it comes up.

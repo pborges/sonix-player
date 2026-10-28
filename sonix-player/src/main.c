@@ -54,6 +54,7 @@
 #include "src/system/streaming/podcaststate.h"
 #include "src/system/streaming/tidalcache.h"
 #include "src/system/streaming/streamkeys.h"
+#include "src/system/abs/abs.h"
 #include "src/system/lastfm/lastfm.h"
 #include "src/system/library/library.h"
 #include "src/system/core/logging.h"
@@ -1960,6 +1961,7 @@ int main(int argc, char **argv) {
 	qobuz_init();
 	tidal_init();
 	lastfm_init();
+	abs_init();
 
 	lv_init();
 

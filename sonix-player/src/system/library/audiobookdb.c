@@ -73,6 +73,9 @@ unsigned audiobookdb_revision(void) {
 
 static pthread_t scan_thread;
 static volatile bool scan_running;
+// Taking scan_running is a test and a set: two threads start scans (the
+// Rescan button, a download that has just finished), and only one may win.
+static pthread_mutex_t scan_claim_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool scan_cancel;
 static volatile int scan_found;
 static char scan_root[512];
@@ -1126,6 +1129,8 @@ static int natural_compare(const char *a, const char *b) {
 	return *a ? 1 : (*b ? -1 : 0);
 }
 
+int audiobookdb_name_compare(const char *a, const char *b) { return natural_compare(a, b); }
+
 static int natural_qsort(const void *a, const void *b) { return natural_compare(*(const char *const *)a, *(const char *const *)b); }
 
 // Reads the names in `path`: files into `files`, subfolders into `dirs`, each
@@ -1770,15 +1775,23 @@ static void *scan_thread_func(void *arg) {
 	return NULL;
 }
 
+// Sets scan_running unless a scan already has it.
+static bool scan_claim(void) {
+	pthread_mutex_lock(&scan_claim_lock);
+	bool won = !scan_running;
+	scan_running = true;
+	pthread_mutex_unlock(&scan_claim_lock);
+	return won;
+}
+
 bool audiobookdb_scan_start(const char *root) {
-	if (!db || scan_running || !root || !root[0]) {
+	if (!db || !root || !root[0] || !scan_claim()) {
 		return false;
 	}
 
 	snprintf(scan_root, sizeof(scan_root), "%s", root);
 	scan_found = 0;
 	scan_cancel = false;
-	scan_running = true;
 
 	if (pthread_create(&scan_thread, NULL, scan_thread_func, NULL) != 0) {
 		scan_running = false;
@@ -1791,6 +1804,61 @@ bool audiobookdb_scan_start(const char *root) {
 }
 
 bool audiobookdb_scan_running(void) { return scan_running; }
+
+// Deletes the rows of the books in `dir` and below, keeping where each was
+// left in old_state for the inserts to copy back. Call with db_lock held.
+static void forget_folder_locked(const char *dir) {
+	exec("CREATE TEMP TABLE IF NOT EXISTS old_state(path TEXT PRIMARY KEY, last_played INT, resume_file TEXT,"
+		 " resume_pos REAL)");
+	exec("DELETE FROM old_state");
+	static const char *const SQL[] = {
+		"INSERT INTO old_state SELECT path, last_played, resume_file, resume_pos FROM AUDIOBOOK_TABLE"
+		" WHERE (path=?1 OR substr(path,1,length(?1)+1)=?1||'/') AND (last_played > 0 OR resume_file IS NOT NULL)",
+		"DELETE FROM AUDIOBOOK_TABLE WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||'/'",
+		"DELETE FROM AUDIOBOOK_PARTS WHERE book=?1 OR substr(book,1,length(?1)+1)=?1||'/'",
+	};
+	for (size_t i = 0; i < sizeof(SQL) / sizeof(SQL[0]); i++) {
+		sqlite3_stmt *stmt = NULL;
+		if (sqlite3_prepare_v2(db, SQL[i], -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(stmt, 1, dir, -1, SQLITE_TRANSIENT);
+			sqlite3_step(stmt);
+		}
+		sqlite3_finalize(stmt);
+	}
+}
+
+bool audiobookdb_scan_folder(const char *root, const char *dir) {
+	if (!db || !root || !root[0] || !dir || strncmp(dir, root, strlen(root)) != 0) {
+		return false;
+	}
+	// A full scan under way may already have passed this folder: wait for it
+	// rather than leave the book out of the index.
+	while (!scan_claim()) {
+		usleep(200 * 1000);
+	}
+	scan_cancel = false;
+	snprintf(scan_root, sizeof(scan_root), "%s", root);
+
+	pthread_mutex_lock(&db_lock);
+	forget_folder_locked(dir);
+	bump_generation();
+	exec("BEGIN");
+	pthread_mutex_unlock(&db_lock);
+
+	// Depth 1: never the Audiobooks folder itself, whose loose files are each
+	// a book of their own.
+	struct stat st;
+	if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+		scan_directory(dir, 1);
+	}
+
+	pthread_mutex_lock(&db_lock);
+	exec("COMMIT");
+	bump_generation();
+	pthread_mutex_unlock(&db_lock);
+	scan_running = false;
+	return true;
+}
 
 int audiobookdb_scan_found(void) { return scan_found; }
 

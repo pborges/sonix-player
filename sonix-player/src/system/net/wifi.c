@@ -1482,6 +1482,20 @@ void wifi_get_status(wifi_status_t *out) {
 	if (!out) {
 		return;
 	}
+#ifdef HOST_BUILD
+	// The simulator has no radio but usually has the PC's network. With
+	// SONIX_HOST_ONLINE=1 it says so, and the pages that wait for Wi-Fi
+	// before signing in or downloading can be tried out.
+	const char *online = getenv("SONIX_HOST_ONLINE");
+	if (online && strcmp(online, "1") == 0) {
+		memset(out, 0, sizeof(*out));
+		out->state = WIFI_STATE_CONNECTED;
+		snprintf(out->ssid, sizeof(out->ssid), "Simulator");
+		snprintf(out->ip, sizeof(out->ip), "127.0.0.1");
+		out->bars = 3;
+		return;
+	}
+#endif
 	pthread_mutex_lock(&lock);
 	*out = g_status;
 	pthread_mutex_unlock(&lock);
