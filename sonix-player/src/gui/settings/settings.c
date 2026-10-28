@@ -9,6 +9,7 @@
 #include "src/gui/settings/ccsettings.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/settings/devoptions.h"
+#include "src/gui/settings/homescreensettings.h"
 #include "src/gui/settings/language.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/settings/kblayoutpage.h"
@@ -552,6 +553,7 @@ void settings_init(gui_config_t *cfg) {
 	settingsrow_heading(container, "settings_section_controls");
 	settingsrow_add(container, "settings_keys", NULL, switch_screen_cb, othersettings_screen);
 	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
+	settingsrow_add(container, "homescreen", NULL, switch_screen_cb, homescreensettings_screen);
 	settingsrow_add(container, "settings_keyboard", NULL, switch_screen_cb, keyboard_screen);
 
 	settingsrow_heading(container, "settings_section_device");
